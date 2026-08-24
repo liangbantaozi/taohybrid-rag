@@ -1,10 +1,10 @@
-TaoHybird RAG（Tao RAG）是一个企业级的 AI 知识库管理系统，采用检索增强生成（RAG）技术，提供智能文档处理和检索能力。
+﻿# TaoHybirdRAG
 
-核心技术栈包括 ElasticSearch、Kafka、WebSocket、Spring Security、Docker、MySQL 和 Redis。
+TaoHybirdRAG 是面向企业知识库问答的 Java RAG 项目，提供文档上传、异步解析、向量化、权限过滤、混合检索、ReAct 工具调用和带引用的流式对话能力。
+
+核心技术栈包括 Spring Boot 3.4.2、Java 17、Vue 3.5、Elasticsearch 8.10、Kafka、WebSocket、MySQL、Redis、MinIO、Apache Tika、LiteParse 与可配置的 LLM/Embedding Provider。
 
 它的目标是帮助企业和个人更高效地管理和利用知识库中的信息，支持多租户架构，允许用户通过自然语言查询知识库，并获得基于自身文档的 AI 生成响应。
-
-![派聪明多模块架构](https://cdn.tobebetterjavaer.com/stutymore/README-20250730102133.png)
 
 系统允许用户：
 
@@ -16,15 +16,15 @@ TaoHybird RAG（Tao RAG）是一个企业级的 AI 知识库管理系统，采�
 用到的技术栈包括，先说后端的：
 
 + 框架 : Spring Boot 3.4.2 (Java 17)
-+ 数据库 : MySQL 8.0
++ 数据库 : MySQL 8.4.10
 + ORM : Spring Data JPA
 + 缓存 : Redis
-+ 搜索引擎 : Elasticsearch 8.10.0
++ 搜索引擎 : Elasticsearch 8.10.4
 + 消息队列 : Apache Kafka
 + 文件存储 : MinIO
-+ 文档解析 : Apache Tika
++ 文档解析 : Apache Tika 2.9.1 + LiteParse
 + 安全认证 : Spring Security + JWT
-+ AI集成 : DeepSeek API/本地 Ollama+豆包 Embedding
++ AI集成 : 可配置的 DeepSeek LLM 与 DashScope Embedding
 + 实时通信 : WebSocket
 + 依赖管理 : Maven
 + 响应式编程 : WebFlux
@@ -33,7 +33,7 @@ TaoHybird RAG（Tao RAG）是一个企业级的 AI 知识库管理系统，采�
 
 ```bash
 src/main/java/com/yizhaoqi/smartpai/
-├── SmartPaiApplication.java      # 主应用程序入口
+├── TaoHybridRagApplication.java   # 当前主应用程序入口
 ├── client/                       # 外部API客户端
 ├── config/                       # 配置类
 ├── consumer/                     # Kafka消费者
@@ -80,35 +80,23 @@ frontend/
 
 ## 核心功能
 
-这里我先带大家了解一下什么是派聪明，我为什么要做Tao RAG这个企业级的 RAG 知识库？派聪明这个 AI 项目能让大家学到什么？以及如何解锁派聪明的源码仓库和教程？
-
-![派聪明的聊天助手：会依据知识库进行问答](https://cdn.tobebetterjavaer.com/paicoding/2550c873a349d8bee29d46400f12ce76.png)
-
-![派聪明的架构概览](https://cdn.tobebetterjavaer.com/stutymore/README-20250730101618.png)
-
 ### 知识库管理
 
-派聪明提供了完整的文档上传与解析功能，支持文件分片上传和断点续传，并支持标签进行组织管理。文档可以是公开的，也可以是私有的，并且可以与特定的组织标签关联，以便更好地进行权限分类。
-
-![派聪明文档处理](https://cdn.tobebetterjavaer.com/stutymore/README-20250730102808.png)
+TaoHybirdRAG 支持文档上传、异步解析和组织标签管理。文档可设为公开或私有，并按用户与组织标签进行权限过滤。
 
 ### AI驱动的RAG实现
 
-派聪明的核心是 RAG 实现：
-
-![派聪明聊天交互](https://cdn.tobebetterjavaer.com/stutymore/README-20250730102837.png)
+TaoHybirdRAG 的 RAG 链路包括：
 
 - 将上传的文档进行语义分块
-- 调用豆包 Embedding 模型为每个文本块生成高维向量
-- 将向量存储到 ElasticSearch 以支持语义搜索和关键词搜索
+- 调用可配置的 Embedding 模型为每个文本块生成向量
+- 将向量存储到 Elasticsearch，以支持语义搜索和关键词检索
 - 可以根据用户的查询检索相关文档
 - 为 LLM 提供完整的上下文，从而生成更准确、基于文档的响应内容
 
 ### 企业级多租户
 
-派聪明通过组织标签支持多租户架构。每个用户可以创建或加入一个或多个组织，每个组织可以拥有独立的知识库和文档管理。这样，企业可以在同一系统中管理多个团队或部门的知识库，而无需担心数据混淆或权限问题。
-
-![派聪明的安全架构](https://cdn.tobebetterjavaer.com/stutymore/README-20250730103118.png)
+TaoHybirdRAG 通过组织标签实现多租户隔离。用户可创建或加入多个组织，检索时结合用户、公开状态和组织标签过滤文档。
 
 ### 实时通信
 
@@ -119,21 +107,19 @@ frontend/
 在开始之前，请确保已安装以下软件：
 
 - Java 17
-- Maven 3.8.6 或更高版本
+- Maven 3.9.6
 - Node.js 18.20.0 或更高版本
 - pnpm 8.7.0 或更高版本
-- MySQL 8.0
-- Elasticsearch 8.10.0
-- MinIO 8.5.12
-- Kafka 3.2.1
-- Redis 7.0.11
+- MySQL 8.4.10
+- Elasticsearch 8.10.4
+- MinIO RELEASE.2025-04-22T22-12-26Z
+- Kafka（当前镜像标签为 `bitnamilegacy/kafka:latest`）
+- Redis 7.4.11
 - Docker（可选，用于运行 Redis、MinIO、Elasticsearch 和 Kafka 等服务）
 
 ## 架构设计
 
-派聪明的架构具备一个现代化的、云原生应用程序的特点，具有清晰的关注点分离、可扩展的组件和与 AI 技术的集成。模块化设计允许随着技术的发展，特别是快速变化的 AI 集成领域，未来可以扩展和替换单个组件。
-
-![派聪明的系统概述](https://cdn.tobebetterjavaer.com/stutymore/README-20250730102655.png)
+TaoHybirdRAG 采用分层后端、异步文档处理和独立检索服务组合，当前重点演进可评测的混合检索、重排、问题改写和数据处理质量。
 
 控制层用于处理 HTTP 请求，验证输入，管理请求/响应格式化，并将业务逻辑委托给服务层。控制器按领域功能组织。遵循 RESTful 设计原则，集成了性能监控和日志记录，用于跟踪 API 使用和故障排除。
 
@@ -220,7 +206,7 @@ public class FileUpload {
 cp .env.example .env
 ```
 
-后端启动时会通过 `DotenvEnvironmentPostProcessor` 自动读取项目根目录 `.env`，所以无论是 IDE 直接运行 `SmartPaiApplication`，还是在项目根目录执行 `mvn spring-boot:run`，都会优先使用这里的配置。
+后端启动时会通过 `DotenvEnvironmentPostProcessor` 自动读取项目根目录 `.env`。可在 IDE 中运行后端启动类，或在项目根目录使用项目内 Maven 启动。
 
 `.env` 里当前主要有三类配置：
 
@@ -244,44 +230,23 @@ cp .env.example .env
 
 ### 2. 启动本地基础服务
 
-`infra.sh` 是现在推荐的本地基础设施启动入口，用来统一管理 `minio`、`kafka`、`elasticsearch`。
+使用独立 Docker Compose 启动基础服务：
 
-### `infra.sh`
-
-用于在本机启动、停止和查看基础依赖服务，目前支持 `minio`、`kafka`、`elasticsearch`。
-
-```bash
-# 启动全部基础服务
-./infra.sh start
-
-# 启动指定服务
-./infra.sh start minio kafka
-
-# 查看状态
-./infra.sh status
-
-# 查看某个服务日志
-./infra.sh logs elasticsearch
-
-# 输出本地访问地址
-./infra.sh urls
-```
-
-如果只想启动部分依赖，也可以按服务名传参：
-
-```bash
-./infra.sh start minio kafka
+```powershell
+cd D:\codextest\TaoHybirdRAG
+docker compose --env-file .\docs\.env.tao-hybird -f .\docs\docker-compose.tao-hybird.yaml -p tao-hybird up -d
 ```
 
 ### 3. 启动后端
 
 基础服务就绪后，在项目根目录启动 Spring Boot：
 
-```bash
-mvn spring-boot:run
+```powershell
+$env:JAVA_HOME = (Resolve-Path .\.local-tools\jdk-17.0.19+10).Path
+& .\.local-tools\apache-maven-3.9.6\bin\mvn.cmd spring-boot:run
 ```
 
-也可以直接在 IDE 中运行 `src/main/java/com/yizhaoqi/smartpai/SmartPaiApplication.java`，效果一样，都会自动读取根目录 `.env`。
+也可以直接在 IDE 中运行后端启动类，效果一样，都会自动读取根目录 `.env`。
 
 ### 4. 启动前端
 
@@ -291,7 +256,7 @@ pnpm install
 pnpm run dev
 ```
 
-前端开发默认访问 `http://localhost:8081/api/v1`，对应配置在 `frontend/.env.test`。
+前端开发服务默认运行在 `http://localhost:9528`，后端运行在 `http://localhost:8082`；代理配置位于 `frontend/.env.test`。
 
 ### 5. 服务器脚本启动
 
@@ -316,7 +281,7 @@ chmod +x launch.sh
 
 ### 6. 前端部署脚本
 
-`deploy-front.sh` 用于构建前端、打 zip 包、上传到服务器，并在远端替换 `/home/www/PaiSmart-Front/dist`。脚本会自动读取根目录 `.env` 中的部署配置。
+`deploy-front.sh` 用于构建前端、打 zip 包并上传到服务器。生产部署前应在 `.env` 中配置独立的目标目录与健康检查地址。
 
 ```bash
 # 直接构建并部署前端
@@ -336,4 +301,3 @@ chmod +x launch.sh
 ```bash
 DEPLOY_SKIP_BUILD=1 ./deploy-front.sh
 ```
-

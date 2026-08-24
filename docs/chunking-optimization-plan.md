@@ -1,8 +1,8 @@
-# PaiSmart 分块策略优化计划
+# TaoHybirdRAG 分块策略优化计划
 
 ## 背景
 
-当前 PaiSmart 的知识库入库链路是：
+当前 TaoHybirdRAG 的知识库入库链路是：
 
 ```text
 上传完成
@@ -17,10 +17,10 @@
 现有文本分块策略主要集中在 `ParseService`：
 
 - 普通文档：Apache Tika 流式解析，先按父缓冲块处理，再切成子块。
-- PDF：PDFBox 按页提取文本，清洗重复页眉页脚后按页分块。
+- PDF：LiteParse 按页解析文本，支持可选 OCR，并清洗空白和常见页脚噪声后按页分块。
 - 子块默认大小：`file.parsing.chunk-size=512`。
 - 切分顺序：段落 -> 句子 -> HanLP 分词 -> 字符兜底。
-- 当前没有 overlap，也没有真实保存 parent chunk。
+- 当前已支持 `overlap-size=100` 和短块合并；父缓冲块用于流式处理，但尚未作为可检索 parent chunk 保存。
 
 这套方案已经可用，但仍有几个明显优化空间：
 
@@ -62,7 +62,8 @@
 - `src/main/java/com/yizhaoqi/smartpai/repository/DocumentVectorRepository.java`
 - `src/main/java/com/yizhaoqi/smartpai/service/VectorizationService.java`
 - `src/main/resources/application*.yml`
-- `src/test/java/com/yizhaoqi/smartpai/service/*ParseService*Test.java`
+- `src/test/java/com/yizhaoqi/smartpai/service/ParseServiceTest.java`
+- `src/test/java/com/yizhaoqi/smartpai/service/ParseServiceUnitTest.java`
 
 ### 任务
 
@@ -158,7 +159,7 @@ src/main/java/com/yizhaoqi/smartpai/service/chunk/
 
 ### 验收标准
 
-- 分块逻辑可以脱离 Tika/PDFBox 独立单测。
+- 分块逻辑可以脱离 Tika/LiteParse 独立单测。
 - `ParseService` 复杂度下降。
 - 当前入库、向量化、检索行为不被破坏。
 - 一期所有测试继续通过。
@@ -335,4 +336,3 @@ HanLP 保留，但定位不是主分块策略。
 5. 五期：结构化文档专项优化。
 
 实际开发建议先从一期开始，不动数据库结构，先把分块质量、顺序稳定性和测试补上。
-
