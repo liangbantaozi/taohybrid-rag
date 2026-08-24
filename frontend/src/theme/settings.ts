@@ -4,8 +4,8 @@ export const themeSettings: App.Theme.ThemeSetting = {
   grayscale: false,
   colourWeakness: false,
   recommendColor: true,
-  themeColor: '#646cff',
-  otherColor: { info: '#2080f0', success: '#52c41a', warning: '#faad14', error: '#f5222d' },
+  themeColor: '#28d7d3',
+  otherColor: { info: '#36aeea', success: '#5dbd8b', warning: '#e7b44b', error: '#e76383' },
   isInfoFollowPrimary: true,
   resetCacheStrategy: 'close',
   layout: { mode: 'vertical', scrollMode: 'content', reverseHorizontalMix: false },
@@ -22,14 +22,14 @@ export const themeSettings: App.Theme.ThemeSetting = {
     mixChildMenuWidth: 200
   },
   footer: { visible: false, fixed: false, height: 48, right: true },
-  watermark: { visible: false, text: 'TaoHybridRAG' },
+  watermark: { visible: false, text: 'TaoHybirdRAG' },
   tokens: {
     light: {
       colors: {
         container: 'rgb(255, 255, 255)',
-        layout: 'rgb(247, 250, 252)',
-        inverted: 'rgb(0, 20, 40)',
-        'base-text': 'rgb(31, 31, 31)'
+        layout: 'rgb(241, 250, 251)',
+        inverted: 'rgb(23, 39, 44)',
+        'base-text': 'rgb(25, 44, 49)'
       },
       boxShadow: {
         header: '0 1px 2px rgb(0, 21, 41, 0.08)',
@@ -37,7 +37,9 @@ export const themeSettings: App.Theme.ThemeSetting = {
         tab: '0 1px 2px rgb(0, 21, 41, 0.08)'
       }
     },
-    dark: { colors: { container: 'rgb(28, 28, 28)', layout: 'rgb(18, 18, 18)', 'base-text': 'rgb(224, 224, 224)' } }
+    dark: {
+      colors: { container: 'rgb(24, 38, 43)', layout: 'rgb(15, 25, 29)', 'base-text': 'rgb(230, 245, 246)' }
+    }
   }
 };
 

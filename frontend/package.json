@@ -2,9 +2,9 @@
   "name": "tao-hybrid-rag",
   "type": "module",
   "version": "1.3.13",
-  "description": "TaoHybridRAG",
+  "description": "TaoHybirdRAG",
   "author": {
-    "name": "TaoHybridRAG",
+    "name": "TaoHybirdRAG",
     "url": ""
   },
   "license": "MIT",

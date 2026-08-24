@@ -385,7 +385,7 @@ onUnmounted(() => {
       <textarea
         ref="inputRef"
         v-model.trim="input.message"
-        placeholder="给 TaoHybridRAG 发送消息，Enter 发送，Shift+Enter 换行"
+        placeholder="给 TaoHybirdRAG 发送消息，Enter 发送，Shift+Enter 换行"
         class="max-h-32 min-h-6 w-full flex-1 resize-none border-none bg-transparent py-1 text-14px color-#333 caret-[rgb(var(--primary-color))] outline-none placeholder:text-#bbb dark:color-#e1e1e1 dark:placeholder:text-#555"
         @keydown="handShortcut"
       />

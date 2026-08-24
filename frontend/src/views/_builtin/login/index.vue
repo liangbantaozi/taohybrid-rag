@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import type { Component } from 'vue';
-import { mixColor } from '@sa/color';
 import { loginModuleRecord } from '@/constants/app';
 import { useAppStore } from '@/store/modules/app';
 import { useThemeStore } from '@/store/modules/theme';
@@ -38,11 +37,7 @@ const moduleMap: Record<UnionKey.LoginModule, LoginModule> = {
 const activeModule = computed(() => moduleMap[props.module || 'pwd-login']);
 const isRegisterModule = computed(() => (props.module || 'pwd-login') === 'register');
 
-const bgColor = computed(() => {
-  const ratio = themeStore.darkMode ? 0.9 : 0;
-
-  return mixColor('#fff', '#000', ratio);
-});
+const bgColor = computed(() => (themeStore.darkMode ? '#0f191d' : '#edf7f8'));
 </script>
 
 <template>
