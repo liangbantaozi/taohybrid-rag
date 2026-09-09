@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Consumer;
 
@@ -109,15 +110,33 @@ public class LlmProviderRouter {
     public List<Map<String, Object>> buildReActMessages(String userMessage,
                                                         String context,
                                                         List<Map<String, String>> history) {
-        return buildReActMessages(userMessage, context, history, "");
+        return buildReActMessages(userMessage, context, history, "", false);
     }
 
     public List<Map<String, Object>> buildReActMessages(String userMessage,
                                                         String context,
                                                         List<Map<String, String>> history,
                                                         String feedbackGuidance) {
+        return buildReActMessages(userMessage, context, history, feedbackGuidance, false);
+    }
+
+    public List<Map<String, Object>> buildReActMessages(String userMessage,
+                                                        String context,
+                                                        List<Map<String, String>> history,
+                                                        String feedbackGuidance,
+                                                        boolean graphSearchEnabled) {
+        return buildReActMessages(userMessage, context, history, feedbackGuidance, graphSearchEnabled, null);
+    }
+
+    public List<Map<String, Object>> buildReActMessages(String userMessage,
+                                                        String context,
+                                                        List<Map<String, String>> history,
+                                                        String feedbackGuidance,
+                                                        boolean graphSearchEnabled,
+                                                        GraphQueryIntent graphIntent) {
         List<Map<String, Object>> messages = new ArrayList<>();
         AiProperties.Prompt promptCfg = aiProperties.getPrompt();
+        boolean graphToolAvailable = graphSearchEnabled && (graphIntent == null || graphIntent.needsGraph());
 
         StringBuilder sysBuilder = new StringBuilder();
         if (promptCfg.getRules() != null) {
@@ -127,7 +146,28 @@ public class LlmProviderRouter {
                 .append("强制检索原则（默认行为）：\n")
                 .append("1. 默认调用 search_knowledge：只要问题涉及任何实体、名称、缩写、产品、项目、术语、流程、功能、实现、背景、对比、引用，或包含「这/它/该/上述/这个/那个」等上下文指代，无论你是否自认为已知答案，都必须先检索，不要等用户说「查知识库」。\n")
                 .append("2. 构造 query 时严格保留用户原话中的核心名词、缩写和限定词，禁止替换为泛化关键词；必要时可在同一次 query 中合并原句与等价改写。\n")
-                .append("3. 用户要求整理、总结、归纳、提炼知识库内容时，先用 search_knowledge 圈定材料，再调用 generate_summary 生成总结。\n\n")
+                .append("3. 用户要求整理、总结、归纳、提炼知识库内容时，先用 search_knowledge 圈定材料，再调用 generate_summary 生成总结。\n");
+        if (graphToolAvailable) {
+            sysBuilder.append("4. 本轮知识图谱参考开关已开启，且轻量路由判定 needs_graph=true。先调用 search_knowledge；如果该问题仍需要跨文档关系、实体关系、条件链、对比、影响、依赖、适用对象或适用范围判断，再补充调用 graph_search_knowledge；不要跳过 search_knowledge 直接调用 graph_search_knowledge。\n");
+            if (graphIntent != null) {
+                sysBuilder.append("5. Graph 路由依据：queryType=")
+                        .append(graphIntent.queryType())
+                        .append(", routeSource=")
+                        .append(graphIntent.routeSource())
+                        .append(", confidence=")
+                        .append(String.format(Locale.ROOT, "%.2f", graphIntent.confidence()))
+                        .append(", reason=")
+                        .append(graphIntent.reason())
+                        .append("。\n\n");
+            } else {
+                sysBuilder.append("5. 即使知识图谱参考开关已开启，普通单点事实、定义、金额、时间、条款查询仍优先只用 search_knowledge，不要为了补充而调用 graph_search_knowledge。\n\n");
+            }
+        } else if (graphSearchEnabled) {
+            sysBuilder.append("4. 本轮知识图谱参考开关已开启，但轻量路由判定 needs_graph=false，因此不能调用 graph_search_knowledge；仍按默认规则判断是否需要 search_knowledge，普通知识库检索足够时基于 search_knowledge 回答。\n\n");
+        } else {
+            sysBuilder.append("4. 本轮知识图谱参考开关关闭，不能调用 graph_search_knowledge；即使问题包含关系、对比、依赖、影响或适用范围，也只能先用 search_knowledge 并基于其结果回答。\n\n");
+        }
+        sysBuilder
                 .append("可以跳过 search_knowledge 的白名单（必须严格匹配其一，否则一律检索）：\n")
                 .append("- 纯打招呼或寒暄（你好/谢谢/再见等）；\n")
                 .append("- 纯翻译请求（把 X 翻译为 Y），且不涉及本系统术语；\n")
@@ -135,8 +175,11 @@ public class LlmProviderRouter {
                 .append("- 通用编程语法、数学计算等完全不依赖任何专有信息的常识题；\n")
                 .append("- 用户在本轮明确表示「不要查知识库 / 直接回答」。\n\n")
                 .append("回答与异常处理：\n")
-                .append("- 只要 search_knowledge 返回了片段，必须基于片段作答并按来源编号标注，禁止回答「知识库暂无相关信息」。\n")
-                .append("- 只有工具明确返回零片段时，才说明暂无相关材料并提示用户补充线索。\n")
+                .append("- 只要 search_knowledge 返回了片段，必须基于片段作答并按来源编号标注，禁止回答「知识库暂无相关信息」。\n");
+        if (graphToolAvailable) {
+            sysBuilder.append("- 如果 graph_search_knowledge 返回的是关系补充证据，最终回答仍必须回到工具返回的原文片段表达，并引用对应来源编号，不要只用抽象关系结论替代原文依据。\n");
+        }
+        sysBuilder.append("- 只有工具明确返回零片段时，才说明暂无相关材料并提示用户补充线索。\n")
                 .append("- 工具失败时根据错误信息决定下一步（重试 / 换 query / 继续推理），不要直接中断。\n")
                 .append("- 如需记录反馈或查看知识库统计，通过 tool_calls 调用对应工具。\n")
                 .append("拿到 tool 结果后继续推理并给出最终回答。\n\n");

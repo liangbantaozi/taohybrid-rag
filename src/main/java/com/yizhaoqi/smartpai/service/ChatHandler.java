@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -30,6 +31,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 聊天处理服务
@@ -48,6 +51,7 @@ public class ChatHandler {
     private static final int MAX_REACT_ROUNDS = 4;
     private static final int MAX_REACT_TOOL_CALLS = 8;
     private static final int REACT_MAX_COMPLETION_TOKENS = 2000;
+    private static final Pattern TOOL_RESULT_REFERENCE_HEADING_PATTERN = Pattern.compile("(?m)^\\[(\\d+)]");
     private final RedisTemplate<String, String> redisTemplate;
     private final HybridSearchService searchService;
     private final LlmProviderRouter llmProviderRouter;
@@ -56,6 +60,7 @@ public class ChatHandler {
     private final ChatGenerationStateService chatGenerationStateService;
     private final ChatSessionRegistry chatSessionRegistry;
     private final AgentToolRegistry agentToolRegistry;
+    private final GraphQueryIntentService graphQueryIntentService;
     private final ThreadPoolTaskExecutor chatMonitorExecutor;
     private final ObjectMapper objectMapper;
     
@@ -71,6 +76,8 @@ public class ChatHandler {
     private final KeySetView<String, Boolean> cancelledGenerations = ConcurrentHashMap.newKeySet();
     // 用于存储每次生成任务的引用映射：generationId -> {referenceNumber -> detail}
     private final Map<String, Map<Integer, ReferenceInfo>> generationReferenceMappings = new ConcurrentHashMap<>();
+    // 记录本轮 ReAct 工具调用判定和成本，用于 Graph 调用质量评测。
+    private final Map<String, ToolDecisionAudit> generationToolAudits = new ConcurrentHashMap<>();
 
     public ChatHandler(RedisTemplate<String, String> redisTemplate,//构造函数注入列表
                       HybridSearchService searchService,
@@ -80,6 +87,7 @@ public class ChatHandler {
                       ChatGenerationStateService chatGenerationStateService,
                       ChatSessionRegistry chatSessionRegistry,
                       AgentToolRegistry agentToolRegistry,
+                      GraphQueryIntentService graphQueryIntentService,
                       ObjectMapper objectMapper,
                       @Qualifier("chatMonitorExecutor") ThreadPoolTaskExecutor chatMonitorExecutor) {
         this.redisTemplate = redisTemplate;
@@ -90,12 +98,17 @@ public class ChatHandler {
         this.chatGenerationStateService = chatGenerationStateService;
         this.chatSessionRegistry = chatSessionRegistry;
         this.agentToolRegistry = agentToolRegistry;
+        this.graphQueryIntentService = graphQueryIntentService;
         this.objectMapper = objectMapper;
         this.chatMonitorExecutor = chatMonitorExecutor;
     }
 
     public void processMessage(String userId, String userMessage, WebSocketSession session) {
-        logger.info("开始处理消息，用户ID: {}, 会话ID: {}", userId, session.getId());
+        processMessage(userId, userMessage, false, session);
+    }
+
+    public void processMessage(String userId, String userMessage, boolean graphSearchEnabled, WebSocketSession session) {
+        logger.info("开始处理消息，用户ID: {}, 会话ID: {}, graphSearchEnabled: {}", userId, session.getId(), graphSearchEnabled);
         String conversationId = null;
         String generationId = null;
         try {
@@ -125,7 +138,7 @@ public class ChatHandler {
             // 3. 异步执行 ReAct 决策循环：模型按需返回 tool_calls，避免在 WebSocket 处理线程上阻塞 90s+ 的工具流
             try {
                 chatMonitorExecutor.execute(() ->
-                        runReActLoopSafely(userId, userMessage, finalConversationId, finalGenerationId, history, responseFuture));
+                        runReActLoopSafely(userId, userMessage, finalConversationId, finalGenerationId, history, responseFuture, graphSearchEnabled));
             } catch (RejectedExecutionException ex) {
                 logger.warn("聊天处理线程池已满，generationId: {}", finalGenerationId);
                 RuntimeException busyException = new RuntimeException("系统繁忙，请稍后重试");
@@ -152,9 +165,10 @@ public class ChatHandler {
                                     String conversationId,
                                     String generationId,
                                     List<Map<String, String>> history,
-                                    CompletableFuture<String> responseFuture) {
+                                    CompletableFuture<String> responseFuture,
+                                    boolean graphSearchEnabled) {
         try {
-            runReActLoop(userId, userMessage, conversationId, generationId, history, responseFuture);
+            runReActLoop(userId, userMessage, conversationId, generationId, history, responseFuture, graphSearchEnabled);
         } catch (Exception e) {
             logger.error("ReAct 循环执行失败: generationId={}", generationId, e);
             chatGenerationStateService.markFailed(generationId, e.getMessage());
@@ -169,13 +183,19 @@ public class ChatHandler {
                               String conversationId,
                               String generationId,
                               List<Map<String, String>> history,
-                              CompletableFuture<String> responseFuture) {
+                              CompletableFuture<String> responseFuture,
+                              boolean graphSearchEnabled) {
+        GraphQueryIntent graphIntent = classifyGraphIntentSafely(userMessage, userId, graphSearchEnabled);
         List<Map<String, Object>> messages = llmProviderRouter.buildReActMessages(
                 userMessage,
                 "",
                 history,
-                buildRecentFeedbackGuidance(userId)
+                buildRecentFeedbackGuidance(userId),
+                graphSearchEnabled,
+                graphIntent
         );
+        List<AgentToolRegistry.AgentTool> availableTools = agentToolRegistry.getTools(graphSearchEnabled, graphIntent);
+        generationToolAudits.put(generationId, new ToolDecisionAudit(graphSearchEnabled, graphIntent));
         int executedToolCalls = 0;
         int totalPromptTokens = 0;
         int totalCompletionTokens = 0;
@@ -186,7 +206,7 @@ public class ChatHandler {
             }
 
             LlmProviderRouter.ReActTurn turn = streamReActTurnBlocking(
-                    userId, conversationId, generationId, messages, agentToolRegistry.getTools());
+                    userId, conversationId, generationId, messages, availableTools);
             if (turn == null) {
                 // 上游 stream 被取消（如用户点 stop），保证内存映射被回收
                 cleanupGenerationState(generationId, null);
@@ -212,7 +232,7 @@ public class ChatHandler {
                     );
                     sendToolCallStatus(userId, generationId, conversationId, toolCall, "failed");
                 } else {
-                    executedToolResult = executeToolForReAct(userId, userMessage, generationId, conversationId, toolCall);
+                    executedToolResult = executeToolForReAct(userId, userMessage, generationId, conversationId, toolCall, graphSearchEnabled, graphIntent);
                     executedToolCalls++;
                 }
                 messages.add(toolMessage(toolCall.id(), executedToolResult.content()));
@@ -247,16 +267,47 @@ public class ChatHandler {
                 new LlmProviderRouter.StreamCompletion(finalTurn.finishReason(), totalPromptTokens, totalCompletionTokens, finalTurn.content().length()));
     }
 
+    private GraphQueryIntent classifyGraphIntentSafely(String userMessage, String userId, boolean graphSearchEnabled) {
+        long startedAt = System.nanoTime();
+        if (!graphSearchEnabled) {
+            return GraphQueryIntent.disabled(elapsedMs(startedAt));
+        }
+        try {
+            return graphQueryIntentService.classify(userMessage, userId, graphSearchEnabled);
+        } catch (Exception e) {
+            logger.warn("Graph 意图路由执行失败，聊天回退为不调用 Graph: userId={}, graphSearchEnabled={}, query={}",
+                    userId, graphSearchEnabled, userMessage, e);
+            return GraphQueryIntent.fallback("Graph 路由异常，回退普通知识库检索", elapsedMs(startedAt));
+        }
+    }
+
     private ExecutedToolResult executeToolForReAct(String userId,
                                                    String userMessage,
                                                    String generationId,
                                                    String conversationId,
-                                                   LlmProviderRouter.ToolCallDecision toolCall) {
+                                                   LlmProviderRouter.ToolCallDecision toolCall,
+                                                   boolean graphSearchEnabled,
+                                                   GraphQueryIntent graphIntent) {
         sendToolCallStatus(userId, generationId, conversationId, toolCall, "executing");
+        if ("graph_search_knowledge".equals(toolCall.name())
+                && (!graphSearchEnabled || graphIntent == null || !graphIntent.needsGraph())) {
+            ToolDecisionAudit audit = generationToolAudits.computeIfAbsent(generationId, ignored -> new ToolDecisionAudit(graphSearchEnabled, graphIntent));
+            String error = graphSearchEnabled ? "graph_route_false" : "graph_disabled";
+            ToolDecisionAudit.ToolCallMetric metric = audit.record(toolCall.name(), false, 0, 0L, audit.hasSearchKnowledge(), error);
+            logToolCallMetric(userId, generationId, conversationId, metric);
+            sendToolCallStatus(userId, generationId, conversationId, toolCall, "failed");
+            if (graphSearchEnabled) {
+                return new ExecutedToolResult("本轮 Graph 轻量路由判定 needs_graph=false，不能调用 graph_search_knowledge。请基于 search_knowledge 的结果回答。", false);
+            }
+            return new ExecutedToolResult("知识图谱参考开关未开启，本轮不能调用 graph_search_knowledge。请基于 search_knowledge 的结果回答。", false);
+        }
         AtomicBoolean summaryStreamStarted = new AtomicBoolean(false);
+        long startedAt = System.nanoTime();
         try {
             logger.info("ReAct 执行 Agent Tool: name={}, userId={}, generationId={}, toolCallId={}, args={}",
                     toolCall.name(), userId, generationId, toolCall.id(), toolCall.arguments());
+            ToolDecisionAudit audit = generationToolAudits.computeIfAbsent(generationId, ignored -> new ToolDecisionAudit(graphSearchEnabled, graphIntent));
+            boolean searchBeforeGraph = audit.hasSearchKnowledge();
             Consumer<String> toolChunkConsumer = "generate_summary".equals(toolCall.name())
                     ? chunk -> {
                         if (chunk == null || chunk.isEmpty()) {
@@ -270,20 +321,36 @@ public class ChatHandler {
                     : null;
             AgentToolRegistry.ToolExecutionResult toolResult =
                     agentToolRegistry.executeTool(toolCall.name(), toolCall.arguments(), userId, toolChunkConsumer);
-
-            // search_knowledge 返回的 SearchResult 列表与模型 prompt 中的 [N] 编号一一对应，
-            // 必须把它落到 generationReferenceMappings 里，否则前端点击引用拿不到 MD5/页码。
-            if ("search_knowledge".equals(toolCall.name())) {
-                replaceReferencesFromSearchTool(generationId, userMessage, toolResult);
-            }
+            long elapsedMs = elapsedMs(startedAt);
+            int resultCount = extractToolResultCount(toolResult);
+            ToolDecisionAudit.ToolCallMetric metric = audit.record(toolCall.name(), true, resultCount, elapsedMs, searchBeforeGraph, null);
+            logToolCallMetric(userId, generationId, conversationId, metric);
 
             String content = toolResult.content();
+            // 检索工具返回的 SearchResult 列表必须落到 generationReferenceMappings 里，
+            // 并保持整轮生成内的引用编号唯一，否则前端点击引用拿不到正确 MD5/页码。
+            if (isReferenceSearchTool(toolCall.name())) {
+                ReferenceMergeResult mergeResult = mergeReferencesFromSearchTool(generationId, userMessage, toolCall.name(), toolResult);
+                content = rewriteToolReferenceNumbers(content, mergeResult.referenceNumberByToolIndex());
+            }
+
             if (content == null || content.isBlank()) {
                 content = "工具 " + toolCall.name() + " 执行成功，但没有返回可展示内容。";
             }
-            sendToolCallStatus(userId, generationId, conversationId, toolCall, "success");
+            sendToolCallStatus(userId, generationId, conversationId, toolCall, "success", Map.of(
+                    "elapsedMs", elapsedMs,
+                    "resultCount", resultCount,
+                    "searchKnowledgeBeforeGraph", metric.searchKnowledgeBeforeGraph(),
+                    "graphSearchEnabled", graphSearchEnabled,
+                    "routeNeedsGraph", graphIntent != null && graphIntent.needsGraph(),
+                    "routeSource", graphIntent != null ? graphIntent.routeSource().name() : "NONE"
+            ));
             return new ExecutedToolResult(content, toolResult.streamedToUser());
         } catch (Exception exception) {
+            long elapsedMs = elapsedMs(startedAt);
+            ToolDecisionAudit audit = generationToolAudits.computeIfAbsent(generationId, ignored -> new ToolDecisionAudit(graphSearchEnabled, graphIntent));
+            ToolDecisionAudit.ToolCallMetric metric = audit.record(toolCall.name(), false, 0, elapsedMs, audit.hasSearchKnowledge(), exception.getMessage());
+            logToolCallMetric(userId, generationId, conversationId, metric);
             logger.warn("ReAct Agent Tool 执行失败，作为 tool message 返回模型: name={}, generationId={}",
                     toolCall.name(), generationId, exception);
             sendToolCallStatus(userId, generationId, conversationId, toolCall, "failed");
@@ -297,41 +364,388 @@ public class ChatHandler {
                         true
                 );
             }
+            if ("graph_search_knowledge".equals(toolCall.name())) {
+                return new ExecutedToolResult(
+                        "Graph 关系证据补充失败: " + exception.getMessage()
+                                + "。请继续基于已有 search_knowledge 结果回答，不要因此中断或声称知识库无资料。",
+                        false
+                );
+            }
             return new ExecutedToolResult("工具 " + toolCall.name() + " 执行失败: " + exception.getMessage(), false);
         }
     }
 
-    private void replaceReferencesFromSearchTool(String generationId,
-                                                 String userMessage,
-                                                 AgentToolRegistry.ToolExecutionResult toolResult) {
+    ReferenceMergeResult mergeReferencesFromSearchTool(String generationId,
+                                                       String userMessage,
+                                                       String toolName,
+                                                       AgentToolRegistry.ToolExecutionResult toolResult) {
         if (toolResult == null || toolResult.data() == null) {
-            return;
+            return ReferenceMergeResult.empty();
         }
         Object resultsObj = toolResult.data().get("results");
         if (!(resultsObj instanceof List<?> rawList) || rawList.isEmpty()) {
-            return;
+            return ReferenceMergeResult.empty();
         }
 
-        Map<Integer, ReferenceInfo> mapping = new HashMap<>();
-        int referenceNumber = 1;
+        Map<Integer, ReferenceInfo> mapping = generationReferenceMappings.computeIfAbsent(
+                generationId,
+                ignored -> new LinkedHashMap<>()
+        );
+        Map<String, Integer> existingReferenceNumbers = buildReferenceDedupIndex(mapping);
+        Map<Integer, Integer> referenceNumberByToolIndex = new LinkedHashMap<>();
+        int toolIndex = 1;
+        int appendedCount = 0;
+        int duplicateCount = 0;
         for (Object item : rawList) {
             if (!(item instanceof SearchResult result) || result.getFileMd5() == null) {
+                toolIndex++;
                 continue;
             }
-            String fileLabel = result.getFileName() != null ? result.getFileName() : "unknown";
-            mapping.put(referenceNumber, buildReferenceInfo(result, fileLabel, userMessage));
-            referenceNumber++;
+            String dedupKey = referenceDedupKey(result.getFileMd5(), result.getChunkId());
+            Integer referenceNumber = existingReferenceNumbers.get(dedupKey);
+            if (referenceNumber == null) {
+                referenceNumber = nextReferenceNumber(mapping);
+                String fileLabel = result.getFileName() != null ? result.getFileName() : "unknown";
+                ReferenceInfo detail = buildReferenceInfo(result, fileLabel, userMessage, toolName);
+                mapping.put(referenceNumber, detail);
+                existingReferenceNumbers.put(dedupKey, referenceNumber);
+                appendedCount++;
+                logger.info("引用映射追加: tool={}, generationId={}, 引用编号#{}, 文件名={}, MD5={}, page={}, retrievalMode={}, chunkId={}",
+                        toolName, generationId, referenceNumber, fileLabel, result.getFileMd5(),
+                        result.getPageNumber(), detail.retrievalMode(), detail.chunkId());
+            } else {
+                duplicateCount++;
+                mapping.computeIfPresent(referenceNumber, (ignored, existing) ->
+                        mergeDuplicateReferenceInfo(existing, result, toolName));
+                logger.info("引用映射去重复用: tool={}, generationId={}, toolIndex={}, 引用编号#{}, MD5={}, chunkId={}",
+                        toolName, generationId, toolIndex, referenceNumber, result.getFileMd5(), result.getChunkId());
+            }
+            referenceNumberByToolIndex.put(toolIndex, referenceNumber);
+            toolIndex++;
         }
-        if (mapping.isEmpty()) {
+        if (referenceNumberByToolIndex.isEmpty()) {
+            return ReferenceMergeResult.empty();
+        }
+        chatGenerationStateService.updateReferenceMappings(generationId, toSerializableReferenceMappings(mapping));
+        logger.info("ReAct 检索工具引用映射已合并: tool={}, generationId={}, total={}, appended={}, duplicated={}",
+                toolName, generationId, mapping.size(), appendedCount, duplicateCount);
+        return new ReferenceMergeResult(referenceNumberByToolIndex, appendedCount, duplicateCount, mapping.size());
+    }
+
+    String rewriteToolReferenceNumbers(String content, Map<Integer, Integer> referenceNumberByToolIndex) {
+        if (content == null || content.isBlank() || referenceNumberByToolIndex == null || referenceNumberByToolIndex.isEmpty()) {
+            return content;
+        }
+
+        Matcher matcher = TOOL_RESULT_REFERENCE_HEADING_PATTERN.matcher(content);
+        StringBuffer rewritten = new StringBuffer();
+        while (matcher.find()) {
+            Integer oldNumber = parseInteger(matcher.group(1));
+            Integer newNumber = oldNumber == null ? null : referenceNumberByToolIndex.get(oldNumber);
+            if (newNumber == null) {
+                matcher.appendReplacement(rewritten, Matcher.quoteReplacement(matcher.group()));
+            } else {
+                matcher.appendReplacement(rewritten, Matcher.quoteReplacement("[" + newNumber + "]"));
+            }
+        }
+        matcher.appendTail(rewritten);
+        return rewritten.toString();
+    }
+
+    private Map<String, Integer> buildReferenceDedupIndex(Map<Integer, ReferenceInfo> mapping) {
+        Map<String, Integer> index = new HashMap<>();
+        if (mapping == null || mapping.isEmpty()) {
+            return index;
+        }
+        for (Map.Entry<Integer, ReferenceInfo> entry : mapping.entrySet()) {
+            ReferenceInfo detail = entry.getValue();
+            if (detail != null && detail.fileMd5() != null) {
+                index.put(referenceDedupKey(detail.fileMd5(), detail.chunkId()), entry.getKey());
+            }
+        }
+        return index;
+    }
+
+    private int nextReferenceNumber(Map<Integer, ReferenceInfo> mapping) {
+        return mapping.keySet().stream().mapToInt(Integer::intValue).max().orElse(0) + 1;
+    }
+
+    private String referenceDedupKey(String fileMd5, Integer chunkId) {
+        return fileMd5 + "\u0000" + chunkId;
+    }
+
+    private Integer parseInteger(String value) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException exception) {
+            return null;
+        }
+    }
+
+    private ReferenceInfo mergeDuplicateReferenceInfo(ReferenceInfo existing, SearchResult duplicate, String toolName) {
+        String mergedRetrievalMode = appendDistinctToken(
+                existing.retrievalMode(),
+                resolveRetrievalMode(duplicate.getRetrievalMode(), toolName)
+        );
+        String mergedSourceTool = appendDistinctToken(existing.sourceTool(), toolName);
+        if (sameText(existing.retrievalMode(), mergedRetrievalMode) && sameText(existing.sourceTool(), mergedSourceTool)) {
+            return existing;
+        }
+        return new ReferenceInfo(
+                existing.fileMd5(),
+                existing.fileName(),
+                existing.pageNumber(),
+                existing.anchorText(),
+                mergedRetrievalMode,
+                buildRetrievalLabel(mergedRetrievalMode),
+                existing.retrievalQuery(),
+                existing.matchedChunkText(),
+                existing.evidenceSnippet(),
+                existing.score(),
+                existing.chunkId(),
+                mergedSourceTool
+        );
+    }
+
+    private String appendDistinctToken(String existing, String incoming) {
+        String normalizedExisting = normalizeNullableToken(existing);
+        String normalizedIncoming = normalizeNullableToken(incoming);
+        if (normalizedIncoming == null) {
+            return normalizedExisting;
+        }
+        if (normalizedExisting == null) {
+            return normalizedIncoming;
+        }
+        for (String token : normalizedExisting.split("\\+")) {
+            if (normalizedIncoming.equals(token.trim())) {
+                return normalizedExisting;
+            }
+        }
+        return normalizedExisting + "+" + normalizedIncoming;
+    }
+
+    private String normalizeNullableToken(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return value.trim();
+    }
+
+    private boolean sameText(String left, String right) {
+        String normalizedLeft = normalizeNullableToken(left);
+        String normalizedRight = normalizeNullableToken(right);
+        return normalizedLeft == null ? normalizedRight == null : normalizedLeft.equals(normalizedRight);
+    }
+
+    private String resolveRetrievalMode(String retrievalMode, String toolName) {
+        if (retrievalMode != null && !retrievalMode.isBlank()) {
+            return retrievalMode.trim();
+        }
+        if ("graph_search_knowledge".equals(toolName)) {
+            return "GRAPH";
+        }
+        return "HYBRID";
+    }
+
+    private boolean isReferenceSearchTool(String toolName) {
+        return "search_knowledge".equals(toolName) || "graph_search_knowledge".equals(toolName);
+    }
+
+    private int extractToolResultCount(AgentToolRegistry.ToolExecutionResult toolResult) {
+        if (toolResult == null || toolResult.data() == null) {
+            return 0;
+        }
+        Object results = toolResult.data().get("results");
+        if (results instanceof List<?> list) {
+            return list.size();
+        }
+        Object sourceCount = toolResult.data().get("sourceCount");
+        if (sourceCount instanceof Number number) {
+            return number.intValue();
+        }
+        return 0;
+    }
+
+    private long elapsedMs(long startedAtNanos) {
+        return Math.max(0L, (System.nanoTime() - startedAtNanos) / 1_000_000L);
+    }
+
+    private void logToolCallMetric(String userId,
+                                   String generationId,
+                                   String conversationId,
+                                   ToolDecisionAudit.ToolCallMetric metric) {
+        if (metric == null) {
             return;
         }
-        // 模型每次 search_knowledge 都会拿到 [1]..[K] 重新编号，因此按"覆盖"语义保存最新一次的引用映射。
-        generationReferenceMappings.put(generationId, mapping);
-        chatGenerationStateService.updateReferenceMappings(generationId, toSerializableReferenceMappings(mapping));
-        logger.info("ReAct search_knowledge 引用映射已刷新: generationId={}, count={}", generationId, mapping.size());
+        logger.info(
+                "ReAct 工具调用审计: userId={}, generationId={}, conversationId={}, sequence={}, tool={}, success={}, elapsedMs={}, resultCount={}, graphCalled={}, searchKnowledgeBeforeGraph={}, graphSearchEnabled={}, routeNeedsGraph={}, routeSource={}, error={}",
+                userId,
+                generationId,
+                conversationId,
+                metric.sequence(),
+                metric.toolName(),
+                metric.success(),
+                metric.elapsedMs(),
+                metric.resultCount(),
+                "graph_search_knowledge".equals(metric.toolName()),
+                metric.searchKnowledgeBeforeGraph(),
+                generationToolAudits.get(generationId) != null && generationToolAudits.get(generationId).graphSearchEnabled(),
+                generationToolAudits.get(generationId) != null && generationToolAudits.get(generationId).routeNeedsGraph(),
+                generationToolAudits.get(generationId) != null ? generationToolAudits.get(generationId).routeSource() : "NONE",
+                metric.error()
+        );
+    }
+
+    private void logToolDecisionSummary(String userId,
+                                        String generationId,
+                                        String conversationId,
+                                        LlmProviderRouter.StreamCompletion completion) {
+        ToolDecisionAudit audit = generationToolAudits.get(generationId);
+        if (audit == null) {
+            return;
+        }
+        logger.info(
+                "ReAct Graph 调用判定汇总: userId={}, generationId={}, conversationId={}, graphSearchEnabled={}, routeNeedsGraph={}, routeSource={}, intentClassifyMs={}, intentClassifyCalled={}, llmIntentTokens={}, toolCallCount={}, searchKnowledgeCallCount={}, graphCalled={}, graphSearchAfterSearch={}, graphResultCount={}, graphElapsedMs={}, promptTokens={}, completionTokens={}",
+                userId,
+                generationId,
+                conversationId,
+                audit.graphSearchEnabled(),
+                audit.routeNeedsGraph(),
+                audit.routeSource(),
+                audit.intentClassifyMs(),
+                audit.intentClassifyCalled(),
+                audit.llmIntentTokens(),
+                audit.totalToolCalls(),
+                audit.searchKnowledgeCalls(),
+                audit.graphCalled(),
+                audit.graphSearchAfterSearch(),
+                audit.graphResultCount(),
+                audit.graphElapsedMs(),
+                completion != null ? completion.promptTokens() : 0,
+                completion != null ? completion.completionTokens() : 0
+        );
     }
 
     private record ExecutedToolResult(String content, boolean streamedToUser) {
+    }
+
+    static class ToolDecisionAudit {
+        private final boolean graphSearchEnabled;
+        private final GraphQueryIntent graphIntent;
+        private int totalToolCalls;
+        private int searchKnowledgeCalls;
+        private boolean graphCalled;
+        private boolean graphSearchAfterSearch;
+        private int graphResultCount;
+        private long graphElapsedMs;
+
+        ToolDecisionAudit(boolean graphSearchEnabled) {
+            this(graphSearchEnabled, null);
+        }
+
+        ToolDecisionAudit(boolean graphSearchEnabled, GraphQueryIntent graphIntent) {
+            this.graphSearchEnabled = graphSearchEnabled;
+            this.graphIntent = graphIntent;
+        }
+
+        synchronized ToolCallMetric record(String toolName,
+                                           boolean success,
+                                           int resultCount,
+                                           long elapsedMs,
+                                           boolean searchKnowledgeBeforeGraph,
+                                           String error) {
+            totalToolCalls++;
+            if ("search_knowledge".equals(toolName)) {
+                searchKnowledgeCalls++;
+            }
+            if ("graph_search_knowledge".equals(toolName)) {
+                graphCalled = true;
+                graphSearchAfterSearch = graphSearchAfterSearch || searchKnowledgeBeforeGraph;
+                graphResultCount += Math.max(resultCount, 0);
+                graphElapsedMs += Math.max(elapsedMs, 0L);
+            }
+            return new ToolCallMetric(
+                    totalToolCalls,
+                    toolName,
+                    success,
+                    Math.max(resultCount, 0),
+                    Math.max(elapsedMs, 0L),
+                    "graph_search_knowledge".equals(toolName) && searchKnowledgeBeforeGraph,
+                    error
+            );
+        }
+
+        synchronized boolean hasSearchKnowledge() {
+            return searchKnowledgeCalls > 0;
+        }
+
+        boolean graphSearchEnabled() {
+            return graphSearchEnabled;
+        }
+
+        boolean routeNeedsGraph() {
+            return graphIntent != null && graphIntent.needsGraph();
+        }
+
+        String routeSource() {
+            return graphIntent == null ? "NONE" : graphIntent.routeSource().name();
+        }
+
+        long intentClassifyMs() {
+            return graphIntent == null ? 0L : graphIntent.intentClassifyMs();
+        }
+
+        boolean intentClassifyCalled() {
+            return graphIntent != null && graphIntent.intentClassifyCalled();
+        }
+
+        int llmIntentTokens() {
+            return graphIntent == null ? 0 : graphIntent.llmIntentTokens();
+        }
+
+        synchronized int totalToolCalls() {
+            return totalToolCalls;
+        }
+
+        synchronized int searchKnowledgeCalls() {
+            return searchKnowledgeCalls;
+        }
+
+        synchronized boolean graphCalled() {
+            return graphCalled;
+        }
+
+        synchronized boolean graphSearchAfterSearch() {
+            return graphSearchAfterSearch;
+        }
+
+        synchronized int graphResultCount() {
+            return graphResultCount;
+        }
+
+        synchronized long graphElapsedMs() {
+            return graphElapsedMs;
+        }
+
+        record ToolCallMetric(int sequence,
+                              String toolName,
+                              boolean success,
+                              int resultCount,
+                              long elapsedMs,
+                              boolean searchKnowledgeBeforeGraph,
+                              String error) {
+        }
+    }
+
+    record ReferenceMergeResult(
+            Map<Integer, Integer> referenceNumberByToolIndex,
+            int appendedCount,
+            int duplicateCount,
+            int totalReferenceCount
+    ) {
+        static ReferenceMergeResult empty() {
+            return new ReferenceMergeResult(Map.of(), 0, 0, 0);
+        }
     }
 
     private Map<String, Object> toolMessage(String toolCallId, String content) {
@@ -501,6 +915,7 @@ public class ChatHandler {
         }
         chatGenerationStateService.markCompleted(generationId, toSerializableReferenceMappings(referenceMappings));
         sendCompletionNotification(userId, generationId, conversationId, false, !persisted);
+        logToolDecisionSummary(userId, generationId, conversationId, completion);
         logger.info("对话存储信息 - Redis键: {}, 值: {}", "user:" + userId + ":current_conversation", conversationId);
         cleanupGenerationState(generationId, null);
         logger.info("消息处理完成，用户ID: {}", userId);
@@ -527,6 +942,7 @@ public class ChatHandler {
     private void cleanupGenerationState(String generationId, Throwable throwable) {
         responseBuilders.remove(generationId);
         generationReferenceMappings.remove(generationId);
+        generationToolAudits.remove(generationId);
         stopFlags.remove(generationId);
         activeStreams.remove(generationId);
         cancelledGenerations.remove(generationId);
@@ -684,7 +1100,7 @@ public class ChatHandler {
     }
 
     private Map<String, Map<String, Object>> toSerializableReferenceMappings(Map<Integer, ReferenceInfo> referenceMapping) {
-        Map<String, Map<String, Object>> serialized = new HashMap<>();
+        Map<String, Map<String, Object>> serialized = new LinkedHashMap<>();
         if (referenceMapping == null || referenceMapping.isEmpty()) {
             return serialized;
         }
@@ -702,6 +1118,7 @@ public class ChatHandler {
             item.put("evidenceSnippet", detail.evidenceSnippet());
             item.put("score", detail.score());
             item.put("chunkId", detail.chunkId());
+            item.put("sourceTool", detail.sourceTool());
             serialized.put(String.valueOf(entry.getKey()), item);
         }
         return serialized;
@@ -781,6 +1198,15 @@ public class ChatHandler {
                                     String conversationId,
                                     LlmProviderRouter.ToolCallDecision toolCall,
                                     String status) {
+        sendToolCallStatus(userId, generationId, conversationId, toolCall, status, Map.of());
+    }
+
+    private void sendToolCallStatus(String userId,
+                                    String generationId,
+                                    String conversationId,
+                                    LlmProviderRouter.ToolCallDecision toolCall,
+                                    String status,
+                                    Map<String, Object> extraFields) {
         Map<String, Object> payload = new HashMap<>();
         payload.put("type", "tool_call");
         payload.put("tool", toolCall.name());
@@ -789,6 +1215,9 @@ public class ChatHandler {
         payload.put("generationId", generationId);
         payload.put("conversationId", conversationId);
         payload.put("timestamp", System.currentTimeMillis());
+        if (extraFields != null && !extraFields.isEmpty()) {
+            payload.putAll(extraFields);
+        }
         chatSessionRegistry.sendJsonToUser(userId, payload);
     }
 
@@ -936,35 +1365,48 @@ public class ChatHandler {
                     (String) item.get("matchedChunkText"),
                     (String) item.get("evidenceSnippet"),
                     item.get("score") instanceof Number number ? number.doubleValue() : null,
-                    item.get("chunkId") instanceof Number number ? number.intValue() : null
+                    item.get("chunkId") instanceof Number number ? number.intValue() : null,
+                    (String) item.get("sourceTool")
             ));
         }
         return referenceMap;
     }
 
     private ReferenceInfo buildReferenceInfo(SearchResult result, String fileLabel, String userMessage) {
+        return buildReferenceInfo(result, fileLabel, userMessage, null);
+    }
+
+    private ReferenceInfo buildReferenceInfo(SearchResult result, String fileLabel, String userMessage, String sourceTool) {
         String matchedChunkText = trimToMaxLength(
                 result.getMatchedChunkText() != null ? result.getMatchedChunkText() : result.getTextContent(),
                 MAX_MATCHED_CHUNK_LEN
         );
         String evidenceSnippet = buildEvidenceSnippet(userMessage, result.getAnchorText(), matchedChunkText);
+        String retrievalMode = resolveRetrievalMode(result.getRetrievalMode(), sourceTool);
 
         return new ReferenceInfo(
                 result.getFileMd5(),
                 fileLabel,
                 result.getPageNumber(),
                 result.getAnchorText(),
-                result.getRetrievalMode(),
-                buildRetrievalLabel(result.getRetrievalMode()),
+                retrievalMode,
+                buildRetrievalLabel(retrievalMode),
                 normalizeEvidenceText(userMessage),
                 matchedChunkText,
                 evidenceSnippet,
                 result.getScore(),
-                result.getChunkId()
+                result.getChunkId(),
+                sourceTool
         );
     }
 
     private String buildRetrievalLabel(String retrievalMode) {
+        if (retrievalMode != null && retrievalMode.toUpperCase().contains("GRAPH")) {
+            if (retrievalMode.contains("+")) {
+                return "混合召回 + Graph关系补充";
+            }
+            return "Graph关系补充";
+        }
         if ("TEXT_ONLY".equalsIgnoreCase(retrievalMode)) {
             return "关键词召回";
         }
@@ -1020,7 +1462,8 @@ public class ChatHandler {
             String matchedChunkText,
             String evidenceSnippet,
             Double score,
-            Integer chunkId
+            Integer chunkId,
+            String sourceTool
     ) {
     }
 

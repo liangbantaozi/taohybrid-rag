@@ -7,7 +7,7 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
   const WS_HEARTBEAT_PONG = '__chat_pong__';
 
   const conversationId = ref<string>('');
-  const input = ref<Api.Chat.Input>({ message: '' });
+  const input = ref<Api.Chat.Input>({ message: '', graphSearchEnabled: false });
   const list = ref<Api.Chat.Message[]>([]);
   const sessions = ref<Api.Chat.ConversationSession[]>([]);
   const sessionsLoading = ref(false);
@@ -341,7 +341,7 @@ export const useChatStore = defineStore(SetupStoreId.Chat, () => {
     clearRateLimitCountdown();
     resetConnectionState();
     conversationId.value = '';
-    input.value = { message: '' };
+    input.value = { message: '', graphSearchEnabled: false };
     list.value = [];
     sessions.value = [];
     wsClose(1000, 'auth-reset');

@@ -69,6 +69,19 @@ const cooldownText = computed(() => {
   return `${rateLimitRemainingSeconds} 秒后可重新发送`;
 });
 
+const graphSearchTooltip = computed(() => {
+  return input.value.graphSearchEnabled
+    ? '知识图谱参考已开启：关系型问题会按需补充检索'
+    : '知识图谱参考已关闭';
+});
+
+function toggleGraphSearch() {
+  if (isSending.value) {
+    return;
+  }
+  input.value.graphSearchEnabled = !input.value.graphSearchEnabled;
+}
+
 function findAssistantMessage(generationId?: string) {
   if (generationId) {
     for (let i = list.value.length - 1; i >= 0; i -= 1) {
@@ -329,8 +342,11 @@ const handleSend = async () => {
     return;
   }
 
+  const message = input.value.message;
+  const graphSearchEnabled = Boolean(input.value.graphSearchEnabled);
+
   list.value.push({
-    content: input.value.message,
+    content: message,
     role: 'user'
   });
   list.value.push({
@@ -339,7 +355,13 @@ const handleSend = async () => {
     status: 'pending',
     toolEvents: []
   });
-  chatStore.wsSend(input.value.message);
+  chatStore.wsSend(
+    JSON.stringify({
+      type: 'chat',
+      message,
+      graphSearchEnabled
+    })
+  );
   input.value.message = '';
   startGenerationStatusMonitor();
 };
@@ -385,10 +407,29 @@ onUnmounted(() => {
       <textarea
         ref="inputRef"
         v-model.trim="input.message"
-        placeholder="给 TaoHybirdRAG 发送消息，Enter 发送，Shift+Enter 换行"
+        placeholder="给 TaoHybridRAG 发送消息，Enter 发送，Shift+Enter 换行"
         class="max-h-32 min-h-6 w-full flex-1 resize-none border-none bg-transparent py-1 text-14px color-#333 caret-[rgb(var(--primary-color))] outline-none placeholder:text-#bbb dark:color-#e1e1e1 dark:placeholder:text-#555"
         @keydown="handShortcut"
       />
+      <NTooltip placement="top">
+        <template #trigger>
+          <NButton
+            class="shrink-0 self-end"
+            size="small"
+            circle
+            :disabled="isSending"
+            :type="input.graphSearchEnabled ? 'primary' : 'default'"
+            :secondary="Boolean(input.graphSearchEnabled)"
+            aria-label="知识图谱参考"
+            @click="toggleGraphSearch"
+          >
+            <template #icon>
+              <icon-material-symbols:account-tree-rounded class="text-16px" />
+            </template>
+          </NButton>
+        </template>
+        {{ graphSearchTooltip }}
+      </NTooltip>
       <NButton
         :disabled="sendDisabled"
         class="shrink-0 self-end"

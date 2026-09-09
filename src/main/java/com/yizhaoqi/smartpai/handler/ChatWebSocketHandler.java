@@ -103,6 +103,19 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
                         chatHandler.stopResponse(userId, generationId);
                         return;
                     }
+
+                    if ("chat".equals(messageType)) {
+                        String chatMessage = String.valueOf(jsonMessage.getOrDefault("message", "")).trim();
+                        boolean graphSearchEnabled = Boolean.TRUE.equals(jsonMessage.get("graphSearchEnabled"));
+                        if (chatMessage.isBlank()) {
+                            sendErrorMessage(session, "消息不能为空");
+                            return;
+                        }
+                        logger.info("收到聊天消息，用户ID: {}，会话ID: {}，graphSearchEnabled: {}",
+                                userId, session.getId(), graphSearchEnabled);
+                        chatHandler.processMessage(userId, chatMessage, graphSearchEnabled, session);
+                        return;
+                    }
                     
                     // 其他JSON消息当作普通消息处理
                     logger.debug("收到JSON格式的聊天消息，当作普通消息处理");

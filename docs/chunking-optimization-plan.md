@@ -1,8 +1,8 @@
-# TaoHybirdRAG 分块策略优化计划
+# TaoHybridRAG 分块策略优化计划
 
 ## 背景
 
-当前 TaoHybirdRAG 的知识库入库链路是：
+当前 TaoHybridRAG 的知识库入库链路是：
 
 ```text
 上传完成

@@ -143,6 +143,10 @@ aliyun:
     read-timeout-millis: ${ALIYUN_OCR_READ_TIMEOUT_MILLIS:60000}
     callback-token: ${ALIYUN_OCR_CALLBACK_TOKEN:}
 
+rag:
+  graph:
+    extraction-enabled: ${RAG_GRAPH_EXTRACTION_ENABLED:false}
+
 elasticsearch:
   # dev 下允许按需使用 https + 自签名证书
   host: ${ELASTICSEARCH_HOST:localhost}

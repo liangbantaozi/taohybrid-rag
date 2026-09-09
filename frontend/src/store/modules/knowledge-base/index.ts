@@ -1,7 +1,41 @@
 import { REQUEST_ID_KEY } from '~/packages/axios/src';
 import { nanoid } from '~/packages/utils/src';
 
-const maxConcurrentChunksPerFile = 4;
+const defaultMaxConcurrentChunksPerFile = 4;
+const uploadBenchmarkEnabled = import.meta.env.DEV && import.meta.env.VITE_UPLOAD_BENCHMARK_ENABLED === 'Y';
+const configuredBenchmarkConcurrency = Number(import.meta.env.VITE_UPLOAD_BENCHMARK_CONCURRENCY);
+const maxConcurrentChunksPerFile = uploadBenchmarkEnabled
+  && Number.isInteger(configuredBenchmarkConcurrency)
+  && configuredBenchmarkConcurrency >= 1
+  && configuredBenchmarkConcurrency <= 8
+  ? configuredBenchmarkConcurrency
+  : defaultMaxConcurrentChunksPerFile;
+const uploadBenchmarkStorageKey = 'tao-hybrid:upload-benchmark-results';
+
+interface UploadBenchmarkRecord {
+  fileName: string;
+  fileSizeBytes: number;
+  chunkSizeBytes: number;
+  concurrency: number;
+  recordedAt: string;
+  chunkUploadMs: number;
+  mergeMs: number;
+  totalMs: number;
+  uploadMiBPerSecond: number;
+}
+
+function saveUploadBenchmarkRecord(record: UploadBenchmarkRecord) {
+  const rawRecords = localStorage.getItem(uploadBenchmarkStorageKey);
+  let records: UploadBenchmarkRecord[] = [];
+  try {
+    records = rawRecords ? JSON.parse(rawRecords) : [];
+  } catch {
+    records = [];
+  }
+  records.push(record);
+  localStorage.setItem(uploadBenchmarkStorageKey, JSON.stringify(records));
+  console.table([record]);
+}
 
 export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () => {
   const tasks = ref<Api.KnowledgeBase.UploadTask[]>([]);
@@ -86,7 +120,11 @@ export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () 
       const { error, data } = await request<Api.KnowledgeBase.MergeResult>({
         url: '/upload/merge',
         method: 'POST',
-        data: { fileMd5: task.fileMd5, fileName: task.fileName }
+        data: {
+          fileMd5: task.fileMd5,
+          fileName: task.fileName,
+          uploadBenchmarkOnly: uploadBenchmarkEnabled
+        }
       });
       if (error) return false;
 
@@ -185,6 +223,7 @@ export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () 
     // 获取第一个待上传的文件
     const task = pendingTasks[0];
     task.status = UploadStatus.Uploading;
+    task.benchmarkStartedAt = uploadBenchmarkEnabled ? performance.now() : undefined;
     activeUploads.value.add(task.fileMd5);
 
     // 计算文件总片数
@@ -205,6 +244,7 @@ export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () 
       }
 
       await uploadChunksInParallel(task, pendingChunkIndexes);
+      const chunkUploadCompletedAt = uploadBenchmarkEnabled ? performance.now() : undefined;
 
       const updatedTask = tasks.value.find(t => t.fileMd5 === task.fileMd5);
       if (!updatedTask) return;
@@ -213,8 +253,25 @@ export const useKnowledgeBaseStore = defineStore(SetupStoreId.KnowledgeBase, () 
         throw new Error('分片上传未完成');
       }
 
+      const mergeStartedAt = uploadBenchmarkEnabled ? performance.now() : undefined;
       const success = await mergeFile(updatedTask);
       if (!success) throw new Error('文件合并失败');
+
+      if (uploadBenchmarkEnabled && task.benchmarkStartedAt !== undefined && chunkUploadCompletedAt !== undefined && mergeStartedAt !== undefined) {
+        const completedAt = performance.now();
+        const chunkUploadMs = chunkUploadCompletedAt - task.benchmarkStartedAt;
+        saveUploadBenchmarkRecord({
+          fileName: task.fileName,
+          fileSizeBytes: task.totalSize,
+          chunkSizeBytes: chunkSize,
+          concurrency: maxConcurrentChunksPerFile,
+          recordedAt: new Date().toISOString(),
+          chunkUploadMs: Math.round(chunkUploadMs),
+          mergeMs: Math.round(completedAt - mergeStartedAt),
+          totalMs: Math.round(completedAt - task.benchmarkStartedAt),
+          uploadMiBPerSecond: Number((task.totalSize / 1024 / 1024 / (chunkUploadMs / 1000)).toFixed(2))
+        });
+      }
     } catch (e) {
       console.error('%c [ 👉 upload error 👈 ]-168', 'font-size:16px; background:#94cc97; color:#d8ffdb;', e);
       // 如果上传失败，则将任务状态设置为中断

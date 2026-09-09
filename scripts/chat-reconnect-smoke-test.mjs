@@ -6,7 +6,7 @@ const DEFAULTS = {
   username: process.env.CHAT_SMOKE_USERNAME ?? 'admin',
   password: process.env.CHAT_SMOKE_PASSWORD,
   prompt:
-    '请用6个编号小节介绍 TaoHybirdRAG 的企业知识库与 RAG 工作流，每节控制在80字左右，最后补3条实施建议。',
+    '请用6个编号小节介绍 TaoHybridRAG 的企业知识库与 RAG 工作流，每节控制在80字左右，最后补3条实施建议。',
   disconnectAfterChunks: 10,
   disconnectDelayMs: 50,
   activeCheckDelayMs: 800,

@@ -92,6 +92,9 @@ public class DocumentService {
     private VectorizationService vectorizationService;
 
     @Autowired
+    private GraphDocumentStateService graphDocumentStateService;
+
+    @Autowired
     private KafkaTemplate<String, Object> kafkaTemplate;
 
     @Autowired
@@ -107,6 +110,7 @@ public class DocumentService {
      * 2. DocumentVector记录
      * 3. MinIO中的文件
      * 4. Elasticsearch中的向量数据
+     * 5. Graph mention/relation/state 记录
      *
      * @param fileMd5 文件MD5
      */
@@ -179,6 +183,8 @@ public class DocumentService {
             // 4. 删除FileUpload记录
             fileUploadRepository.deleteByFileMd5(fileMd5);
             logger.info("成功删除文件上传记录: {}", fileMd5);
+
+            cleanupGraphByDeletedFile(fileMd5);
             
             logger.info("文档删除完成: {}", fileMd5);
         } catch (Exception e) {
@@ -349,6 +355,31 @@ public class DocumentService {
         }
 
         return deepestMessage;
+    }
+
+    private void cleanupGraphByDeletedFile(String fileMd5) {
+        try {
+            GraphDocumentStateService.GraphFileCleanupResult result = graphDocumentStateService.deleteGraphByFile(fileMd5);
+            logger.info(
+                    "成功清理已删除文档的图谱数据: fileMd5={}, deletedMentions={}, deletedRelations={}, deletedStates={}",
+                    fileMd5,
+                    result.deletedMentionCount(),
+                    result.deletedRelationCount(),
+                    result.deletedStateCount()
+            );
+        } catch (Exception e) {
+            logger.warn("删除文档后清理图谱数据失败，文档删除结果保持成功: fileMd5={}, error={}", fileMd5, e.getMessage(), e);
+            try {
+                graphDocumentStateService.markFailed(fileMd5, "删除文档后清理图谱数据失败: " + e.getMessage());
+            } catch (Exception stateException) {
+                logger.warn(
+                        "删除文档后记录图谱清理失败状态也失败: fileMd5={}, error={}",
+                        fileMd5,
+                        stateException.getMessage(),
+                        stateException
+                );
+            }
+        }
     }
 
     private String trimVectorizationErrorMessage(String errorMessage) {

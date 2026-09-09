@@ -116,7 +116,7 @@ watch(
     <aside class="invite-side-panel">
       <div class="invite-side-header">
         <div class="invite-side-kicker">邀请码获取</div>
-        <div class="invite-side-title">TaoHybirdRAG 混合检索知识库项目，欢迎体验。</div>
+        <div class="invite-side-title">TaoHybridRAG 混合检索知识库项目，欢迎体验。</div>
         <div class="invite-side-desc">
           微信搜索
           <span class="invite-emphasis">{{ inviteChannelConfig.officialAccountName }}</span>

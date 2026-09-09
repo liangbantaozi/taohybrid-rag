@@ -373,6 +373,7 @@ declare namespace Api {
       createdAt?: string;
       mergedAt?: string;
       requestIds?: string[]; // 请求ID，用于取消上传
+      benchmarkStartedAt?: number;
     }
     type List = Common.PaginatingQueryRecord<UploadTask>;
 
@@ -411,6 +412,7 @@ declare namespace Api {
     interface Input {
       message: string;
       conversationId?: string;
+      graphSearchEnabled?: boolean;
     }
 
     interface Output {

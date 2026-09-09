@@ -112,6 +112,10 @@ declare namespace Env {
     readonly VITE_DEVTOOLS_LAUNCH_EDITOR?: import('vite-plugin-vue-devtools').VitePluginVueDevToolsOptions['launchEditor'];
     /** The timeout of the websocket */
     readonly VITE_WS_TIMEOUT: number;
+    /** Enable upload-only benchmarking in local development. */
+    readonly VITE_UPLOAD_BENCHMARK_ENABLED?: CommonType.YesOrNo;
+    /** Per-file concurrent chunk requests used by the local upload benchmark. */
+    readonly VITE_UPLOAD_BENCHMARK_CONCURRENCY?: string;
   }
 }
 

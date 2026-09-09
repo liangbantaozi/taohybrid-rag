@@ -30,6 +30,9 @@ spring:
       enabled: true
       max-file-size: 50MB
       max-request-size: 100MB
+tao-hybrid:
+  upload-benchmark:
+    enabled: ${UPLOAD_BENCHMARK_ENABLED:false}
   kafka:
     enabled: true
     bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
@@ -174,6 +177,10 @@ knowledge:
     org-tag: ${KNOWLEDGE_BOOTSTRAP_ORG_TAG:default}
     public: ${KNOWLEDGE_BOOTSTRAP_PUBLIC:true}
     user-id: ${KNOWLEDGE_BOOTSTRAP_USER_ID:system-bootstrap}
+
+rag:
+  graph:
+    extraction-enabled: ${RAG_GRAPH_EXTRACTION_ENABLED:false}
 
 elasticsearch:
   # 本地如果是自签名证书，可设为 https + trust-all=true。

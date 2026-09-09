@@ -8,6 +8,7 @@ import com.yizhaoqi.smartpai.repository.DocumentVectorRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -28,6 +29,15 @@ public class VectorizationService {
 
     @Autowired
     private DocumentVectorRepository documentVectorRepository;
+
+    @Autowired
+    private GraphExtractionService graphExtractionService;
+
+    @Autowired
+    private GraphDocumentStateService graphDocumentStateService;
+
+    @Value("${rag.graph.extraction-enabled:false}")
+    private boolean graphExtractionEnabled;
 
     /**
      * 执行向量化操作
@@ -88,6 +98,8 @@ public class VectorizationService {
 
             elasticsearchService.bulkIndex(esDocuments); // 批量存储到 Elasticsearch
 
+            rebuildGraphIfEnabled(fileMd5, userId, orgTag, isPublic);
+
             logger.info("向量化完成，fileMd5: {}", fileMd5);
             return new VectorizationUsageResult(
                     embeddingResult.totalTokens(),
@@ -101,6 +113,47 @@ public class VectorizationService {
                 throw new RuntimeException("向量化失败", e);
             }
             throw new RuntimeException("向量化失败: " + message, e);
+        }
+    }
+
+    private void rebuildGraphIfEnabled(String fileMd5, String userId, String orgTag, boolean isPublic) {
+        if (!graphExtractionEnabled) {
+            return;
+        }
+
+        try {
+            if (!graphDocumentStateService.isAutoBuildAllowed(fileMd5, userId, orgTag, isPublic)) {
+                logger.info("Graph RAG 抽取跳过，文件未启用建图: fileMd5={}", fileMd5);
+                return;
+            }
+            graphDocumentStateService.markBuilding(fileMd5, userId, orgTag, isPublic);
+            GraphExtractionService.GraphExtractionResult result = graphExtractionService.rebuildForFile(fileMd5, userId, orgTag, isPublic);
+            graphDocumentStateService.markCompleted(fileMd5, result);
+            logger.info(
+                    "Graph RAG 抽取完成，fileMd5: {}, chunks: {}, entities: {}, mentions: {}, relations: {}, buildMs: {}",
+                    fileMd5,
+                    result.chunkCount(),
+                    result.entityCount(),
+                    result.mentionCount(),
+                    result.relationCount(),
+                    result.buildMs()
+            );
+        } catch (Exception e) {
+            markGraphFailedSafely(fileMd5, e);
+            logger.warn("Graph RAG 抽取失败，保持向量化结果返回，fileMd5: {}, error: {}", fileMd5, e.getMessage(), e);
+        }
+    }
+
+    private void markGraphFailedSafely(String fileMd5, Exception extractionException) {
+        try {
+            graphDocumentStateService.markFailed(fileMd5, extractionException.getMessage());
+        } catch (Exception stateException) {
+            logger.warn(
+                    "Graph RAG 失败状态标记失败，保持向量化结果返回，fileMd5: {}, error: {}",
+                    fileMd5,
+                    stateException.getMessage(),
+                    stateException
+            );
         }
     }
     

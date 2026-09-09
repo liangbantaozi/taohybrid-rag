@@ -12,6 +12,7 @@ import com.yizhaoqi.smartpai.service.UploadService;
 import com.yizhaoqi.smartpai.service.UserService;
 import com.yizhaoqi.smartpai.utils.LogUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -51,6 +52,9 @@ public class UploadController {
 
     @Autowired
     private ParseService parseService;
+
+    @Value("${tao-hybrid.upload-benchmark.enabled:false}")
+    private boolean uploadBenchmarkEnabled;
 
     public UploadController(UploadService uploadService, KafkaTemplate<String, Object> kafkaTemplate) {
         this.uploadService = uploadService;
@@ -267,6 +271,10 @@ public class UploadController {
         LogUtils.PerformanceMonitor monitor = LogUtils.startPerformanceMonitor("MERGE_FILE");
         try {
             String fileType = getFileType(request.fileName());
+            boolean uploadBenchmarkOnly = Boolean.TRUE.equals(request.uploadBenchmarkOnly());
+            if (uploadBenchmarkOnly && !uploadBenchmarkEnabled) {
+                throw new CustomException("上传基准模式仅允许在显式启用的开发环境使用", HttpStatus.FORBIDDEN);
+            }
             LogUtils.logBusiness("MERGE_FILE", userId, "接收到合并文件请求: fileMd5=%s, fileName=%s, fileType=%s", 
                     request.fileMd5(), request.fileName(), fileType);
             
@@ -352,6 +360,26 @@ public class UploadController {
 
             fileUpload = fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(request.fileMd5(), userId)
                     .orElseThrow(() -> new RuntimeException("文件记录不存在"));
+
+            if (uploadBenchmarkOnly) {
+                fileUpload.setVectorizationStatus(null);
+                fileUpload.setVectorizationErrorMessage(null);
+                fileUpload.setActualEmbeddingTokens(null);
+                fileUpload.setActualChunkCount(null);
+                fileUploadRepository.save(fileUpload);
+
+                Map<String, Object> data = new HashMap<>();
+                data.put("object_url", objectUrl);
+                data.put("benchmarkUploadOnly", true);
+
+                Map<String, Object> response = new HashMap<>();
+                response.put("code", 200);
+                response.put("message", "上传基准完成，已跳过解析和向量化");
+                response.put("data", data);
+                LogUtils.logUserOperation(userId, "MERGE_FILE", request.fileMd5(), "BENCHMARK_UPLOAD_ONLY_SUCCESS");
+                monitor.end("上传基准完成，跳过后处理");
+                return ResponseEntity.ok(response);
+            }
 
             ParseService.EmbeddingEstimate embeddingEstimate = null;
             try (io.minio.GetObjectResponse mergedFileStream = uploadService.getMergedFileStream(request.fileMd5())) {
@@ -485,7 +513,11 @@ public class UploadController {
     /**
      * 合并请求的辅助类，包含文件的MD5值和文件名
      */
-    public record MergeRequest(String fileMd5, String fileName) {}
+    public record MergeRequest(String fileMd5, String fileName, Boolean uploadBenchmarkOnly) {
+        public MergeRequest(String fileMd5, String fileName) {
+            this(fileMd5, fileName, false);
+        }
+    }
 
     /**
      * 获取支持的文件类型列表接口

@@ -27,6 +27,9 @@ replay_pid*
 .vite-ssg-dist
 .vite-ssg-temp
 .env
+frontend/.env.local
+testdata/upload_benchmark/
+testdata/rag-eval/source-documents/
 *.local
 dist
 dist-ssr
@@ -80,6 +83,7 @@ src/main/resources/cert
 .pnpm-store/
 .qoder/
 tmp/
+.tmp/
 frontend/test-results/
 *.iml
 *.bak
@@ -90,4 +94,11 @@ CLAUDE.md
 docs/docker-compose.yaml
 docs/interview.md
 docs/resume.md
-docs/.env.tao-hybird
+docs/.env.tao-hybrid
+
+# Local evaluation outputs and metric reports
+testdata/rag-eval/
+docs/retrieval-evaluation-baseline.md
+docs/graph-rag-stage8-evaluation.md
+docs/upload-benchmark-results.md
+docs/images/6.png

@@ -1,6 +1,6 @@
 # Chat Reconnect Smoke Test
 
-This repo includes a reproducible reconnect test script for TaoHybirdRAG.
+This repo includes a reproducible reconnect test script for TaoHybridRAG.
 
 ```powershell
 $env:CHAT_SMOKE_PASSWORD = 'your-local-test-password'
@@ -26,7 +26,7 @@ The script exits with code `1` if any of these checks fail.
 
 ## Common usage
 
-Local TaoHybirdRAG backend on `8082`:
+Local TaoHybridRAG backend on `8082`:
 
 ```powershell
 $env:CHAT_SMOKE_PASSWORD = 'your-local-test-password'

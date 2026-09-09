@@ -72,6 +72,7 @@ const sourceFiles = ref<Array<{fileName: string, id: string, referenceNumber: nu
 const bareUrlPattern = /https?:\/\/[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+/g;
 const toolNameLabels: Record<string, string> = {
   search_knowledge: '检索知识库',
+  graph_search_knowledge: '知识图谱参考',
   generate_summary: '生成知识摘要',
   submit_feedback: '记录反馈',
   knowledge_stats: '读取知识库统计'
@@ -370,7 +371,7 @@ async function handleSourceFileClick(fileInfo: {
         <SystemLogo class="text-6 text-white" />
       </NAvatar>
       <div class="flex-col gap-1">
-        <NText class="text-4 font-bold">TaoHybirdRAG</NText>
+        <NText class="text-4 font-bold">TaoHybridRAG</NText>
         <NText class="text-3 color-gray-500">{{ formatDate(msg.timestamp) }}</NText>
       </div>
     </div>

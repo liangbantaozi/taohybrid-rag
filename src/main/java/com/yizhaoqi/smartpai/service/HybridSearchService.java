@@ -21,6 +21,7 @@ import co.elastic.clients.elasticsearch._types.query_dsl.Operator;
 import java.util.Collections;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.Set;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -31,6 +32,7 @@ import java.util.stream.Collectors;
  */
 @Service
 public class HybridSearchService {
+    private static final int RRF_RANK_CONSTANT = 60;
 
     private static final Logger logger = LoggerFactory.getLogger(HybridSearchService.class);
 
@@ -177,6 +179,117 @@ public class HybridSearchService {
                 logger.error("后备搜索也失败", fallbackError);
                 return Collections.emptyList();
             }
+        }
+    }
+
+    /** Executes the permission-aware BM25 baseline used by retrieval evaluation. */
+    public List<SearchResult> searchBm25WithPermission(String query, String userId, int topK) {
+        List<String> userEffectiveTags = getUserEffectiveOrgTags(userId);
+        return textOnlySearchWithPermission(query, getUserDbId(userId), userEffectiveTags, topK);
+    }
+
+    /** Executes a pure KNN baseline with the same document permissions as hybrid search. */
+    public List<SearchResult> searchVectorWithPermission(String query, String userId, int topK) {
+        try {
+            List<String> userEffectiveTags = getUserEffectiveOrgTags(userId);
+            String userDbId = getUserDbId(userId);
+            List<Float> queryVector = embedToVectorList(query, userId);
+            if (queryVector == null) {
+                logger.warn("向量生成失败，VECTOR 基线返回空结果");
+                return Collections.emptyList();
+            }
+
+            SearchResponse<EsDocument> response = esClient.search(s -> s
+                    .index(knowledgeIndexName)
+                    .knn(kn -> kn
+                            .field("vector")
+                            .queryVector(queryVector)
+                            .k(topK)
+                            .numCandidates(Math.max(topK * 30, 100))
+                            .filter(f -> f.bool(bf -> bf
+                                    .should(s1 -> s1.term(t -> t.field("userId").value(userDbId)))
+                                    .should(s2 -> s2.term(t -> t.field("public").value(true)))
+                                    .should(s3 -> {
+                                        if (userEffectiveTags.isEmpty()) {
+                                            return s3.matchNone(mn -> mn);
+                                        } else if (userEffectiveTags.size() == 1) {
+                                            return s3.term(t -> t.field("orgTag").value(userEffectiveTags.get(0)));
+                                        }
+                                        return s3.bool(inner -> {
+                                            userEffectiveTags.forEach(tag -> inner.should(sh -> sh.term(t -> t.field("orgTag").value(tag))));
+                                            return inner;
+                                        });
+                                    })
+                            ))
+                    )
+                    .size(topK), EsDocument.class);
+
+            List<SearchResult> results = response.hits().hits().stream()
+                    .map(hit -> {
+                        assert hit.source() != null;
+                        return new SearchResult(
+                                hit.source().getFileMd5(), hit.source().getChunkId(), hit.source().getTextContent(), hit.score(),
+                                hit.source().getUserId(), hit.source().getOrgTag(), hit.source().isPublic(), null,
+                                hit.source().getPageNumber(), hit.source().getAnchorText(), "VECTOR", hit.source().getTextContent());
+                    })
+                    .toList();
+            attachFileNames(results);
+            return results;
+        } catch (Exception e) {
+            logger.error("纯向量搜索失败", e);
+            return Collections.emptyList();
+        }
+    }
+
+    /** Returns the best chunk per source file for document-level retrieval evaluation. */
+    public List<SearchResult> searchDistinctFilesWithPermission(String query, String userId, int topK) {
+        return distinctByFileMd5(searchWithPermission(query, userId, evaluationCandidateSize(topK)), topK);
+    }
+
+    /** Returns the best BM25 chunk per source file for document-level retrieval evaluation. */
+    public List<SearchResult> searchBm25DistinctFilesWithPermission(String query, String userId, int topK) {
+        return distinctByFileMd5(searchBm25WithPermission(query, userId, evaluationCandidateSize(topK)), topK);
+    }
+
+    /** Returns the best pure-vector chunk per source file for document-level retrieval evaluation. */
+    public List<SearchResult> searchVectorDistinctFilesWithPermission(String query, String userId, int topK) {
+        return distinctByFileMd5(searchVectorWithPermission(query, userId, evaluationCandidateSize(topK)), topK);
+    }
+
+    /**
+     * Evaluation-only RRF experiment. Dense and BM25 each contribute independent candidates;
+     * no keyword match is required for a dense candidate to remain eligible.
+     */
+    public List<SearchResult> searchRrfDistinctFilesWithPermission(String query, String userId, int topK) {
+        int candidateSize = evaluationCandidateSize(topK);
+        List<SearchResult> denseResults = searchVectorWithPermission(query, userId, candidateSize);
+        List<SearchResult> bm25Results = searchBm25WithPermission(query, userId, candidateSize);
+        return distinctByFileMd5(fuseByRrf(denseResults, bm25Results), topK);
+    }
+
+    private List<SearchResult> fuseByRrf(List<SearchResult> denseResults, List<SearchResult> bm25Results) {
+        Map<String, SearchResult> candidates = new LinkedHashMap<>();
+        Map<String, Double> scores = new LinkedHashMap<>();
+        addRrfScores(candidates, scores, denseResults);
+        addRrfScores(candidates, scores, bm25Results);
+
+        return candidates.entrySet().stream()
+                .map(entry -> {
+                    SearchResult result = entry.getValue();
+                    result.setScore(scores.get(entry.getKey()));
+                    result.setRetrievalMode("HYBRID_RRF");
+                    return result;
+                })
+                .sorted((left, right) -> Double.compare(right.getScore(), left.getScore()))
+                .toList();
+    }
+
+    private void addRrfScores(Map<String, SearchResult> candidates, Map<String, Double> scores, List<SearchResult> results) {
+        for (int index = 0; index < results.size(); index++) {
+            SearchResult result = results.get(index);
+            String key = result.getFileMd5() + ":" + result.getChunkId();
+            candidates.putIfAbsent(key, result);
+            scores.merge(key, 1d / (RRF_RANK_CONSTANT + index + 1), Double::sum);
         }
     }
 
@@ -498,5 +611,26 @@ public class HybridSearchService {
         } catch (Exception e) {
             logger.error("补充文件名失败", e);
         }
+    }
+
+    private int evaluationCandidateSize(int topK) {
+        return Math.max(topK, Math.min(topK * 10, 100));
+    }
+
+    private List<SearchResult> distinctByFileMd5(List<SearchResult> results, int topK) {
+        if (results == null || results.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Map<String, SearchResult> bestByFile = new LinkedHashMap<>();
+        for (SearchResult result : results) {
+            if (result.getFileMd5() == null) {
+                continue;
+            }
+            bestByFile.putIfAbsent(result.getFileMd5(), result);
+            if (bestByFile.size() >= topK) {
+                break;
+            }
+        }
+        return new ArrayList<>(bestByFile.values());
     }
 }

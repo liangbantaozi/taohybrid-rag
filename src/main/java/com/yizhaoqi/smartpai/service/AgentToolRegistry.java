@@ -29,6 +29,7 @@ public class AgentToolRegistry {
     private static final int MAX_SEARCH_DOCS = 20;
 
     private final HybridSearchService hybridSearchService;
+    private final GraphSearchService graphSearchService;
     private final DeepSeekClient deepSeekClient;
     private final StringRedisTemplate stringRedisTemplate;
     private final ElasticsearchClient elasticsearchClient;
@@ -38,12 +39,14 @@ public class AgentToolRegistry {
     private final Map<String, ToolHandler> handlers;
 
     public AgentToolRegistry(HybridSearchService hybridSearchService,
+                             GraphSearchService graphSearchService,
                              DeepSeekClient deepSeekClient,
                              StringRedisTemplate stringRedisTemplate,
                              ElasticsearchClient elasticsearchClient,
                              FileUploadRepository fileUploadRepository,
                              @Value("${elasticsearch.index-name:knowledge_base}") String knowledgeIndexName) {
         this.hybridSearchService = hybridSearchService;
+        this.graphSearchService = graphSearchService;
         this.deepSeekClient = deepSeekClient;
         this.stringRedisTemplate = stringRedisTemplate;
         this.elasticsearchClient = elasticsearchClient;
@@ -51,12 +54,14 @@ public class AgentToolRegistry {
         this.knowledgeIndexName = knowledgeIndexName;
         this.tools = List.of(
                 searchKnowledgeTool(),
+                graphSearchKnowledgeTool(),
                 generateSummaryTool(),
                 submitFeedbackTool(),
                 knowledgeStatsTool()
         );
         this.handlers = Map.of(
                 "search_knowledge", this::executeSearchKnowledge,
+                "graph_search_knowledge", this::executeGraphSearchKnowledge,
                 "generate_summary", this::executeGenerateSummary,
                 "submit_feedback", this::executeSubmitFeedback,
                 "knowledge_stats", this::executeKnowledgeStats
@@ -65,6 +70,24 @@ public class AgentToolRegistry {
 
     public List<AgentTool> getTools() {
         return tools;
+    }
+
+    public List<AgentTool> getTools(boolean graphSearchEnabled) {
+        if (graphSearchEnabled) {
+            return tools;
+        }
+        return tools.stream()
+                .filter(tool -> !"graph_search_knowledge".equals(tool.name()))
+                .toList();
+    }
+
+    public List<AgentTool> getTools(boolean graphSearchEnabled, GraphQueryIntent graphIntent) {
+        if (graphSearchEnabled && graphIntent != null && graphIntent.needsGraph()) {
+            return tools;
+        }
+        return tools.stream()
+                .filter(tool -> !"graph_search_knowledge".equals(tool.name()))
+                .toList();
     }
 
     public Optional<AgentTool> getTool(String name) {
@@ -95,12 +118,35 @@ public class AgentToolRegistry {
         String query = getRequiredString(arguments, "query");
         int topK = getInt(arguments, "topK", DEFAULT_TOP_K, 1, MAX_SEARCH_DOCS);
 
+        long startedAt = System.nanoTime();
         List<SearchResult> results = hybridSearchService.searchWithPermission(query, userId, topK);
+        long searchMs = elapsedMs(startedAt);
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("query", query);
         data.put("topK", topK);
         data.put("results", results);
+        data.put("resultCount", results.size());
+        data.put("searchMs", searchMs);
         return new ToolExecutionResult("search_knowledge", true, formatSearchResults(results), data);
+    }
+
+    private ToolExecutionResult executeGraphSearchKnowledge(Map<String, Object> arguments,
+                                                            String userId,
+                                                            Consumer<String> onChunk) {
+        requireUserId(userId);
+        String query = getRequiredString(arguments, "query");
+        int topK = getInt(arguments, "topK", DEFAULT_TOP_K, 1, MAX_SEARCH_DOCS);
+
+        long startedAt = System.nanoTime();
+        List<SearchResult> results = graphSearchService.searchWithPermission(query, userId, topK);
+        long searchMs = elapsedMs(startedAt);
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("query", query);
+        data.put("topK", topK);
+        data.put("results", results);
+        data.put("resultCount", results.size());
+        data.put("searchMs", searchMs);
+        return new ToolExecutionResult("graph_search_knowledge", true, formatGraphSearchResults(results), data);
     }
 
     private ToolExecutionResult executeGenerateSummary(Map<String, Object> arguments,
@@ -190,6 +236,17 @@ public class AgentToolRegistry {
         );
     }
 
+    private AgentTool graphSearchKnowledgeTool() {
+        return new AgentTool(
+                "graph_search_knowledge",
+                "Graph 关系证据补充工具，不是默认检索工具。仅当用户问题涉及跨文档关系、实体关系、条件链、对比、依赖、影响、适用对象、适用范围或政策/资料之间联系时，且已经调用过 search_knowledge 或当前上下文已有知识库检索结果后，再补充调用。普通单点事实、定义、金额、时间、条款查询优先只用 search_knowledge；不要跳过 search_knowledge 直接调用本工具。",
+                objectSchema(Map.of(
+                        "query", stringSchema("用于 Graph 关系检索的查询语句。保留用户问题中的核心实体、关系词、条件、比较对象和限定范围。"),
+                        "topK", integerSchema("返回的关系证据片段数量，默认 5，允许范围 1-20。")
+                ), List.of("query"))
+        );
+    }
+
     private AgentTool generateSummaryTool() {
         return new AgentTool(
                 "generate_summary",
@@ -273,6 +330,15 @@ public class AgentToolRegistry {
         return output.toString();
     }
 
+    private String formatGraphSearchResults(List<SearchResult> results) {
+        if (results == null || results.isEmpty()) {
+            return "Graph 关系证据补充：未检索到关系补充片段。"
+                    + "这不代表普通知识库无资料；请继续基于已有 search_knowledge 结果回答。";
+        }
+        return "Graph 关系证据补充：以下片段用于补充跨文档关系、实体关系、条件链、对比、依赖、影响或适用范围判断；最终回答应回到原文证据表达并标注来源编号。\n\n"
+                + formatSearchResults(results);
+    }
+
     private String formatKnowledgeStats(Map<String, Object> data) {
         return "知识库统计："
                 + "\n- MySQL 文档总数：" + data.get("documentCount")
@@ -332,6 +398,10 @@ public class AgentToolRegistry {
 
     private String nullToDash(Object value) {
         return value == null ? "-" : String.valueOf(value);
+    }
+
+    private long elapsedMs(long startedAtNanos) {
+        return Math.max(0L, (System.nanoTime() - startedAtNanos) / 1_000_000L);
     }
 
     private void requireUserId(String userId) {

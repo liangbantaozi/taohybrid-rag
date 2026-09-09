@@ -1,5 +1,5 @@
 <script setup lang="tsx">
-import type { UploadFileInfo } from 'naive-ui';
+import type { DataTableColumns, PaginationProps, UploadFileInfo } from 'naive-ui';
 import { NButton, NEllipsis, NModal, NPopconfirm, NProgress, NTag, NUpload } from 'naive-ui';
 import type { FlatResponseData } from '@sa/axios';
 import { uploadAccept } from '@/constants/common';
@@ -11,6 +11,41 @@ import SearchDialog from './modules/search-dialog.vue';
 
 const appStore = useAppStore();
 const authStore = useAuthStore();
+
+type GraphStatus = 'NOT_BUILT' | 'BUILDING' | 'COMPLETED' | 'FAILED';
+
+interface GraphCandidate {
+  fileMd5: string;
+  fileName: string;
+  userId?: string;
+  orgTag?: string | null;
+  orgTagName?: string | null;
+  public?: boolean;
+  isPublic?: boolean;
+  vectorizationStatus?: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | null;
+  actualChunkCount?: number | null;
+  graphEnabled: boolean;
+  graphScope: 'ENTERPRISE' | 'ORG' | 'PRIVATE' | string;
+  scopeId?: string | null;
+  graphStatus: GraphStatus;
+  chunkCount?: number | null;
+  entityCount: number;
+  mentionCount: number;
+  relationCount: number;
+  buildMs?: number | null;
+  lastBuiltAt?: string | null;
+  graphError?: string | null;
+}
+
+interface GraphCandidateList {
+  data?: GraphCandidate[];
+  content?: GraphCandidate[];
+  items?: GraphCandidate[];
+  number?: number;
+  page?: number;
+  size?: number;
+  totalElements?: number;
+}
 
 // 文件预览相关状态
 const previewVisible = ref(false);
@@ -278,6 +313,271 @@ function handleSearch() {
 }
 // #endregion
 
+// #region 知识图谱管理
+const graphVisible = ref(false);
+const graphLoading = ref(false);
+const graphKeyword = ref('');
+const graphCandidates = ref<GraphCandidate[]>([]);
+const graphOperatingFileMd5 = ref('');
+
+const graphPagination = reactive<PaginationProps>({
+  page: 1,
+  pageSize: 10,
+  itemCount: 0,
+  showSizePicker: true,
+  pageSizes: [10, 20, 50],
+  onUpdatePage: async (page: number) => {
+    graphPagination.page = page;
+    await getGraphCandidates();
+  },
+  onUpdatePageSize: async (pageSize: number) => {
+    graphPagination.pageSize = pageSize;
+    graphPagination.page = 1;
+    await getGraphCandidates();
+  }
+});
+
+const graphMobilePagination = computed(() => ({
+  ...graphPagination,
+  pageSlot: appStore.isMobile ? 3 : 9
+}));
+
+const graphColumns = computed<DataTableColumns<GraphCandidate>>(() => [
+  {
+    key: 'fileName',
+    title: '文件名',
+    minWidth: 260,
+    render: row => (
+      <div class="min-w-0">
+        <NEllipsis lineClamp={2} tooltip>
+          {row.fileName}
+        </NEllipsis>
+        <div class="mt-1 text-xs text-stone-400 font-mono">{shortMd5(row.fileMd5)}</div>
+      </div>
+    )
+  },
+  {
+    key: 'scope',
+    title: '范围',
+    width: 140,
+    render: row => renderGraphScope(row)
+  },
+  {
+    key: 'graphStatus',
+    title: 'Graph 状态',
+    width: 130,
+    render: row => renderGraphStatus(row)
+  },
+  {
+    key: 'counts',
+    title: '构建指标',
+    width: 150,
+    render: row => (
+      <div class="text-xs leading-5">
+        <div>{Number(row.chunkCount || 0).toLocaleString()} 个切片</div>
+        <div>{Number(row.entityCount || 0).toLocaleString()} 个实体</div>
+        <div class="text-stone-400">{Number(row.mentionCount || 0).toLocaleString()} 次提及</div>
+        <div class="text-stone-400">{Number(row.relationCount || 0).toLocaleString()} 条关系</div>
+      </div>
+    )
+  },
+  {
+    key: 'buildMs',
+    title: '构建耗时',
+    width: 110,
+    render: row => formatBuildMs(row.buildMs)
+  },
+  {
+    key: 'lastBuiltAt',
+    title: '最后构建',
+    width: 150,
+    render: row => formatGraphTime(row.lastBuiltAt)
+  },
+  {
+    key: 'graphError',
+    title: '错误摘要',
+    minWidth: 220,
+    render: row =>
+      row.graphError ? (
+        <NEllipsis lineClamp={2} tooltip>
+          {row.graphError}
+        </NEllipsis>
+      ) : (
+        <span class="text-stone-400">-</span>
+      )
+  },
+  {
+    key: 'operate',
+    title: '操作',
+    width: 260,
+    fixed: 'right',
+    render: row => (
+      <div class="flex flex-wrap gap-2">
+        {!row.graphEnabled ? (
+          <NPopconfirm onPositiveClick={() => handleGraphAction(row, 'enable')}>
+            {{
+              default: () => '启用后该文件允许建立知识图谱，确认继续吗？',
+              trigger: () => (
+                <NButton size="small" type="primary" ghost loading={isGraphOperating(row)} disabled={isGraphActionLocked()}>
+                  启用建图
+                </NButton>
+              )
+            }}
+          </NPopconfirm>
+        ) : null}
+        <NPopconfirm onPositiveClick={() => handleGraphAction(row, 'rebuild')}>
+          {{
+            default: () => '将基于当前已向量化切片重建该文件图谱，确认继续吗？',
+            trigger: () => (
+              <NButton
+                size="small"
+                type="warning"
+                ghost
+                loading={isGraphOperating(row)}
+                disabled={!canRebuildGraph(row) || isGraphActionLocked()}
+              >
+                更新图谱
+              </NButton>
+            )
+          }}
+        </NPopconfirm>
+        <NPopconfirm onPositiveClick={() => handleGraphAction(row, 'remove')}>
+          {{
+            default: () => '仅移出知识图谱，不会删除原知识库文件，确认继续吗？',
+            trigger: () => (
+              <NButton size="small" type="error" ghost loading={isGraphOperating(row)} disabled={isGraphActionLocked()}>
+                移出图谱
+              </NButton>
+            )
+          }}
+        </NPopconfirm>
+      </div>
+    )
+  }
+]);
+
+function handleGraphManage() {
+  graphVisible.value = true;
+  getGraphCandidates();
+}
+
+async function handleGraphSearch() {
+  graphPagination.page = 1;
+  await getGraphCandidates();
+}
+
+async function getGraphCandidates() {
+  if (!authStore.isAdmin) return;
+
+  graphLoading.value = true;
+  try {
+    const { data: payload, error } = await request<GraphCandidateList>({
+      url: '/admin/rag-graph/document-states/candidates',
+      params: {
+        keyword: graphKeyword.value || undefined,
+        page: Number(graphPagination.page || 1),
+        size: Number(graphPagination.pageSize || 10)
+      }
+    });
+
+    if (!error && payload) {
+      graphCandidates.value = payload.data || payload.content || payload.items || [];
+      graphPagination.page = payload.number || payload.page || Number(graphPagination.page || 1);
+      graphPagination.pageSize = payload.size || Number(graphPagination.pageSize || 10);
+      graphPagination.itemCount = payload.totalElements || 0;
+    }
+  } finally {
+    graphLoading.value = false;
+  }
+}
+
+async function handleGraphAction(row: GraphCandidate, action: 'enable' | 'rebuild' | 'remove') {
+  if (isGraphActionLocked()) return;
+
+  graphOperatingFileMd5.value = row.fileMd5;
+  const actionUrlMap = {
+    enable: `/admin/rag-graph/document-states/${row.fileMd5}/enable`,
+    rebuild: `/admin/rag-graph/document-states/${row.fileMd5}/rebuild`,
+    remove: `/admin/rag-graph/document-states/${row.fileMd5}/remove`
+  };
+  const actionMessageMap = {
+    enable: '已启用建图',
+    rebuild: '图谱已更新',
+    remove: '已移出图谱'
+  };
+
+  try {
+    const { error } = await request({
+      url: actionUrlMap[action],
+      method: 'POST'
+    });
+
+    if (!error) {
+      window.$message?.success(actionMessageMap[action]);
+      await getGraphCandidates();
+    }
+  } finally {
+    graphOperatingFileMd5.value = '';
+  }
+}
+
+function canRebuildGraph(row: GraphCandidate) {
+  return row.graphEnabled && (row.vectorizationStatus === 'COMPLETED' || Number(row.actualChunkCount || 0) > 0);
+}
+
+function isGraphOperating(row: GraphCandidate) {
+  return graphOperatingFileMd5.value === row.fileMd5;
+}
+
+function isGraphActionLocked() {
+  return graphLoading.value || Boolean(graphOperatingFileMd5.value);
+}
+
+function renderGraphStatus(row: GraphCandidate) {
+  if (!row.graphEnabled) {
+    return <NTag type="default">未启用</NTag>;
+  }
+  const statusMap: Record<GraphStatus, { type: 'default' | 'success' | 'warning' | 'error' | 'info'; label: string }> = {
+    NOT_BUILT: { type: 'default', label: '未构建' },
+    BUILDING: { type: 'info', label: '构建中' },
+    COMPLETED: { type: 'success', label: '已完成' },
+    FAILED: { type: 'error', label: '失败' }
+  };
+  const status = statusMap[row.graphStatus] || { type: 'default' as const, label: row.graphStatus || '-' };
+  return <NTag type={status.type}>{status.label}</NTag>;
+}
+
+function renderGraphScope(row: GraphCandidate) {
+  if (row.public || row.isPublic) {
+    return <NTag type="success">公开</NTag>;
+  }
+  if (row.graphScope === 'PRIVATE') {
+    return <NTag type="warning">私有</NTag>;
+  }
+  return (
+    <NTag type="primary">
+      <NEllipsis tooltip>{row.orgTagName || row.orgTag || row.scopeId || '-'}</NEllipsis>
+    </NTag>
+  );
+}
+
+function formatGraphTime(value?: string | null) {
+  return value ? dayjs(value).format('YYYY-MM-DD HH:mm') : '-';
+}
+
+function formatBuildMs(value?: number | null) {
+  if (value === null || value === undefined) return '-';
+  const ms = Number(value);
+  if (!Number.isFinite(ms)) return '-';
+  if (ms < 1000) return `${ms} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
+
+function shortMd5(fileMd5: string) {
+  return fileMd5 ? `${fileMd5.substring(0, 8)}...` : '-';
+}
+// #endregion
+
 // 渲染上传状态
 function renderStatus(status: UploadStatus, percentage: number) {
   if (status === UploadStatus.Completed) return <NTag type="success">已完成</NTag>;
@@ -516,6 +816,12 @@ async function onBeforeUpload(
       <template #header-extra>
         <TableHeaderOperation v-model:columns="columnChecks" :loading="loading" @add="handleUpload" @refresh="getList">
           <template #prefix>
+            <NButton v-if="authStore.isAdmin" size="small" ghost type="primary" @click="handleGraphManage">
+              <template #icon>
+                <icon-mdi-graph-outline class="text-icon" />
+              </template>
+              知识图谱
+            </NButton>
             <NButton size="small" ghost type="primary" @click="handleSearch">
               <template #icon>
                 <icon-ic-round-search class="text-icon" />
@@ -542,6 +848,43 @@ async function onBeforeUpload(
     <UploadDialog v-model:visible="uploadVisible" />
     <SearchDialog v-model:visible="searchVisible" />
 
+    <NDrawer v-model:show="graphVisible" placement="right" :width="appStore.isMobile ? '100%' : 1040">
+      <NDrawerContent title="知识图谱" closable :native-scrollbar="false">
+        <div class="h-full min-h-0 flex flex-col gap-12px">
+          <div class="flex flex-wrap items-center justify-between gap-12px">
+            <NInput
+              v-model:value="graphKeyword"
+              clearable
+              placeholder="按文件名或 MD5 搜索"
+              class="w-320px lt-sm:w-full"
+              @keyup.enter="handleGraphSearch"
+            />
+            <div class="flex gap-8px">
+              <NButton type="primary" :loading="graphLoading" @click="handleGraphSearch">搜索</NButton>
+              <NButton :loading="graphLoading" @click="getGraphCandidates">刷新</NButton>
+            </div>
+          </div>
+          <NDataTable
+            :columns="graphColumns"
+            :data="graphCandidates"
+            size="small"
+            :scroll-x="1290"
+            :loading="graphLoading"
+            remote
+            :row-key="row => row.fileMd5"
+            :pagination="graphMobilePagination"
+            class="graph-candidate-table"
+          >
+            <template #empty>
+              <div class="py-24px text-center text-#8a8f98">
+                暂无可建图文件，请确认文件已上传完成并完成向量化
+              </div>
+            </template>
+          </NDataTable>
+        </div>
+      </NDrawerContent>
+    </NDrawer>
+
     <!-- 文件预览弹窗 -->
     <NModal v-model:show="previewVisible" class="document-preview-modal" :auto-focus="false">
       <div class="document-preview-modal-shell">
@@ -555,6 +898,13 @@ async function onBeforeUpload(
     </NModal>
   </div>
 </template>
+
+<style scoped>
+.graph-candidate-table {
+  max-height: calc(100vh - 220px);
+  overflow: auto;
+}
+</style>
 
 <style scoped lang="scss">
 .file-list-container {
